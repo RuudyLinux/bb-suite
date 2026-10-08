@@ -1,0 +1,318 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    background-color: #06080e;
+    color: #e2e8f0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    overflow: hidden;
+    position: relative;
+    background-image:
+      radial-gradient(circle at 15% 15%, rgba(0, 255, 136, 0.05) 0%, transparent 40%),
+      radial-gradient(circle at 85% 85%, rgba(0, 240, 255, 0.04) 0%, transparent 40%),
+      radial-gradient(circle at 50% 50%, rgba(168, 85, 247, 0.02) 0%, transparent 60%),
+      linear-gradient(to right, rgba(255, 255, 255, 0.012) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.012) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 100% 100%, 40px 40px, 40px 40px;
+  }
+
+  /* Ultra-subtle cyber scanline */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(0deg,
+        transparent,
+        transparent 3px,
+        rgba(0, 0, 0, 0.10) 3px,
+        rgba(0, 0, 0, 0.10) 6px);
+    pointer-events: none;
+    z-index: 9999;
+    opacity: 0.65;
+  }
+
+  /* Subtle vignette */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at center, transparent 60%, rgba(4, 6, 12, 0.80) 100%);
+    pointer-events: none;
+    z-index: 9998;
+  }
+
+  /* Premium scrollbars */
+  ::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: rgba(8, 12, 22, 0.6);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 9999px;
+    transition: background 0.2s;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 255, 136, 0.55);
+    box-shadow: 0 0 10px rgba(0, 255, 136, 0.4);
+  }
+
+  /* Selection highlight */
+  ::selection {
+    background: rgba(0, 255, 136, 0.25);
+    color: #fff;
+  }
+}
+
+@layer components {
+
+  /* Frosted Glass Cards */
+  .cyber-card {
+    @apply bg-cyber-surface/70 backdrop-blur-xl border border-white/[0.08] rounded-xl shadow-glass transition-all duration-300;
+  }
+
+  .cyber-card:hover {
+    @apply border-white/[0.13];
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+
+  .cyber-card-glow {
+    @apply bg-cyber-surface/80 backdrop-blur-xl border border-emerald-500/20 rounded-xl transition-all duration-300;
+    box-shadow: 0 0 25px rgba(0, 255, 136, 0.08);
+  }
+
+  .cyber-card-glow:hover {
+    @apply border-emerald-500/40;
+    box-shadow: 0 0 30px rgba(0, 255, 136, 0.18);
+  }
+
+  /* Inputs & Form Elements */
+  .hack-input {
+    @apply w-full bg-cyber-bg/90 border border-white/[0.1] text-slate-200 text-sm px-3.5 py-2.5 font-mono rounded-lg placeholder-slate-600 focus:outline-none focus:border-neon-emerald focus:ring-2 focus:ring-neon-emerald/20 transition-all duration-200;
+  }
+
+  .hack-select {
+    @apply bg-cyber-bg/90 border border-white/[0.1] text-slate-200 text-xs px-3.5 py-2.5 font-mono rounded-lg focus:outline-none focus:border-neon-emerald focus:ring-2 focus:ring-neon-emerald/20 cursor-pointer transition-all duration-200;
+  }
+
+  /* High-Tech Action Buttons */
+  .hack-btn {
+    @apply relative overflow-hidden bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-bold px-6 py-2.5 text-xs uppercase tracking-widest rounded-lg active:scale-[0.98] transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100;
+    box-shadow: 0 0 20px rgba(16, 185, 129, 0.35);
+  }
+
+  .hack-btn:hover {
+    box-shadow: 0 0 25px rgba(0, 255, 136, 0.6);
+  }
+
+  /* Shimmer sweep on hack-btn */
+  .hack-btn::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 60%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.25), transparent);
+    transform: skewX(-20deg);
+    transition: left 0.5s ease;
+  }
+
+  .hack-btn:hover::after {
+    left: 150%;
+  }
+
+  .hack-btn-secondary {
+    @apply bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.1] hover:border-white/[0.2] text-slate-200 font-medium px-4 py-2 text-xs rounded-lg transition-all duration-200 active:scale-[0.98];
+  }
+
+  .hack-btn-sm {
+    @apply border border-white/[0.12] hover:border-neon-emerald/50 bg-white/[0.02] hover:bg-emerald-500/10 text-slate-300 hover:text-neon-emerald px-3 py-1.5 text-xs font-mono rounded-md transition-all duration-150;
+  }
+
+  .hack-label {
+    @apply text-slate-400 text-xs font-medium uppercase tracking-wider mb-1.5 block;
+  }
+
+  .section-title {
+    @apply text-slate-400 text-xs font-semibold uppercase tracking-widest mb-3 flex items-center gap-2;
+  }
+
+  /* Legacy alias */
+  .hack-card {
+    @apply cyber-card;
+  }
+
+  /* Sidebar nav link */
+  .nav-link {
+    @apply relative flex items-center px-3 py-2 text-xs font-mono cursor-pointer text-slate-400 rounded-lg hover:text-white hover:bg-white/[0.05] transition-all duration-150 select-none;
+  }
+
+  .nav-link.active {
+    @apply text-neon-emerald bg-emerald-500/10 font-semibold border-l-2 border-neon-emerald;
+    box-shadow: inset 4px 0 12px -2px rgba(0, 255, 136, 0.25);
+  }
+
+  /* Severity Badges */
+  .sev-badge {
+    @apply text-[11px] font-bold px-2.5 py-0.5 uppercase tracking-wider rounded-md font-mono inline-flex items-center gap-1.5;
+  }
+
+  .sev-critical {
+    @apply bg-rose-500/15 text-rose-400 border border-rose-500/30;
+    box-shadow: 0 0 12px rgba(244, 63, 94, 0.2);
+  }
+
+  .sev-high {
+    @apply bg-amber-500/15 text-amber-400 border border-amber-500/30;
+  }
+
+  .sev-medium {
+    @apply bg-yellow-500/15 text-yellow-300 border border-yellow-500/30;
+  }
+
+  .sev-low {
+    @apply bg-blue-500/15 text-blue-400 border border-blue-500/30;
+  }
+
+  .sev-pass {
+    @apply bg-emerald-500/15 text-emerald-400 border border-emerald-500/30;
+  }
+
+  .sev-info {
+    @apply bg-cyan-500/15 text-cyan-400 border border-cyan-500/30;
+  }
+
+  /* Glitch text effect */
+  .glitch-text {
+    animation: glitch 5s infinite;
+  }
+
+  /* Scanning beam */
+  .scan-beam {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg,
+        transparent 0%,
+        rgba(0, 255, 136, 0.04) 49%,
+        rgba(0, 255, 136, 0.08) 50%,
+        rgba(0, 255, 136, 0.04) 51%,
+        transparent 100%);
+    background-size: 100% 200%;
+    animation: scan-beam 4s linear infinite;
+    pointer-events: none;
+  }
+}
+
+@layer utilities {
+  .text-glow-emerald {
+    text-shadow: 0 0 12px rgba(0, 255, 136, 0.6);
+  }
+
+  .text-glow-cyan {
+    text-shadow: 0 0 12px rgba(0, 240, 255, 0.6);
+  }
+
+  .text-glow-rose {
+    text-shadow: 0 0 12px rgba(244, 63, 94, 0.6);
+  }
+
+  .text-glow {
+    text-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
+  }
+
+  .border-glow {
+    box-shadow: 0 0 12px rgba(0, 255, 136, 0.3);
+  }
+
+  /* Neon border glow */
+  .glow-border-emerald {
+    box-shadow: 0 0 0 1px rgba(0, 255, 136, 0.3), 0 0 20px rgba(0, 255, 136, 0.1);
+  }
+
+  .glow-border-rose {
+    box-shadow: 0 0 0 1px rgba(244, 63, 94, 0.3), 0 0 20px rgba(244, 63, 94, 0.1);
+  }
+
+  .glow-border-cyan {
+    box-shadow: 0 0 0 1px rgba(0, 240, 255, 0.3), 0 0 20px rgba(0, 240, 255, 0.1);
+  }
+}
+
+/* Extra keyframes not in Tailwind config */
+@keyframes scan-beam {
+  0% {
+    background-position: 0 -100%;
+  }
+
+  100% {
+    background-position: 0 200%;
+  }
+}
+
+@keyframes glitch {
+
+  0%,
+  88%,
+  100% {
+    text-shadow: none;
+    transform: none;
+  }
+
+  89% {
+    text-shadow: 2px 0 #f43f5e, -2px 0 #00f0ff;
+    transform: translateX(1px);
+  }
+
+  90% {
+    text-shadow: -2px 0 #f43f5e, 2px 0 #00f0ff;
+    transform: translateX(-1px);
+  }
+
+  91% {
+    text-shadow: 2px 0 #00f0ff, -2px 0 #f43f5e;
+    transform: translateX(0);
+  }
+}
+
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUp {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Animate-fade-in and animate-slide-up as utility classes (since Tailwind config already defines them) */
+.animate-fade-in {
+  animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-slide-up {
+  animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}

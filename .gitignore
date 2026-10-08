@@ -1,0 +1,51 @@
+# Python Virtual Environments & Packages
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node / Frontend
+frontend/node_modules/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Sensitive Files & API Keys
+key.env
+*.env
+.env.*
+!.env.example
+!key.env.example
+
+# Scan Reports & Runtime Databases
+reports/*.json
+reports/*.html
+reports/*.png
+reports/*.db
+reports/bbsuite.db
+
+# Playwright & Browser Artifacts
+.playwright/
+test-results/
+
+# System & IDE files
+.claude/
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+.system_generated/
+scratch/

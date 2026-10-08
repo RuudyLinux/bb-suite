@@ -1,0 +1,14 @@
+# Core — required
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+httpx==0.25.2
+dnspython==2.4.2
+pydantic==2.5.0
+python-multipart==0.0.6
+cryptography==41.0.7
+
+# v3.0 — installed by install.bat
+playwright
+anthropic
+pymysql
+# psycopg2-binary  <- requires PostgreSQL client; skip on Windows without pg_config
