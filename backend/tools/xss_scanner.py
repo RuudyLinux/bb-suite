@@ -1,268 +1,258 @@
-"""
-XSS Scanner — Reflected, Stored indicator, and DOM-based XSS detection.
-Tests URL parameters, forms, and headers with polyglot payloads.
+"""XSS Scanner — Context-Aware Cross-Site Scripting Detection Engine.
+
+Distinguishes between:
+- Safe encoded reflection (HTML entities)
+- Benign reflected text
+- Attribute-context breakout
+- Script/event-handler execution context
+Employs safe unique markers and four-tier confidence taxonomy: Confirmed, Likely, Possible, Not Detected.
 """
 from __future__ import annotations
 import asyncio
+import html
 import re
-import time
-from urllib.parse import urlencode, urlparse, parse_qs, urljoin
-from typing import List, Dict, Tuple, Optional, Any
-import httpx
+import secrets
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-router = APIRouter()
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.http_client import safe_request
+from backend.security.target_validator import TargetValidationError, validate_target_url
+from backend.tools.utils import clean_url, err, ok
 
-# Polyglot XSS payloads covering reflected, attribute, JS context
-PAYLOADS = [
-    "<script>alert('XSS')</script>",
-    '"><script>alert(1)</script>',
-    "'><img src=x onerror=alert(1)>",
-    "<svg/onload=alert(1)>",
-    "javascript:alert(1)",
-    "<img src=x onerror=alert(document.domain)>",
-    '"><svg onload=alert(1)>',
-    "';alert(1)//",
-    '"><body onload=alert(1)>',
-    "<iframe src=javascript:alert(1)>",
-    "<details open ontoggle=alert(1)>",
-    "{{7*7}}",  # Template injection probe
-    "${7*7}",   # JS template literal probe
-]
+router = APIRouter(tags=["scanning"])
 
 DOM_SINKS = [
     r"document\.write\s*\(",
     r"innerHTML\s*=",
     r"outerHTML\s*=",
     r"eval\s*\(",
-    r"setTimeout\s*\(",
-    r"setInterval\s*\(",
+    r"setTimeout\s*\([^,]+[+\`]",
+    r"setInterval\s*\([^,]+[+\`]",
     r"location\.href\s*=",
     r"location\.replace\s*\(",
-    r"document\.location\s*=",
-    r"window\.location\s*=",
 ]
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (BB-Suite XSS Scanner)",
-    "Accept": "text/html,application/xhtml+xml,*/*",
-}
 
 
 class XSSRequest(BaseModel):
-    target: str
-    mode: str = "reflected"   # reflected | dom | forms | all
-    max_params: int = 10
+    target: str = Field(..., min_length=1, max_length=2048)
+    mode: str = Field("reflected", max_length=64)   # reflected | dom | all
+    max_params: int = Field(10, ge=1, le=50)
 
 
-def _normalize_url(url: str) -> str:
-    if not url.startswith("http"):
-        url = "https://" + url
-    return url
-
-
-def _inject_params(url: str, payload: str) -> list[str]:
-    """Return list of URLs with each param replaced by payload."""
+def build_probe_url(url: str, param: str, probe_value: str) -> str:
     parsed = urlparse(url)
     params = parse_qs(parsed.query, keep_blank_values=True)
-    injected = []
-    for key in list(params.keys()):
-        modified = dict(params)
-        modified[key] = [payload]
-        flat = {k: v[0] for k, v in modified.items()}
-        new_url = parsed._replace(query=urlencode(flat)).geturl()
-        injected.append((key, new_url))
-    return injected
+    params[param] = [probe_value]
+    flat = {k: v[0] for k, v in params.items()}
+    return urlunparse(parsed._replace(query=urlencode(flat)))
 
 
-def _check_reflection(response_text: str, payload: str) -> bool:
-    """Check if payload is reflected unencoded."""
-    return payload in response_text or payload.lower() in response_text.lower()
+def analyze_reflection_context(response_body: str, marker: str) -> Tuple[str, bool, str]:
+    """Analyze the specific DOM context where the marker is reflected.
 
-
-def _score_context(text: str, payload: str) -> str:
-    """Determine reflection context."""
-    idx = text.lower().find(payload.lower()[:20])
+    Returns:
+        (context_name, is_executable, evidence_snippet)
+    """
+    idx = response_body.find(marker)
     if idx == -1:
-        return "unknown"
-    snippet = text[max(0, idx-80):idx+80]
-    if "<script" in snippet.lower():
-        return "script_context"
-    if re.search(r'on\w+\s*=', snippet, re.I):
-        return "event_handler"
-    if snippet.count('"') % 2 != 0 or snippet.count("'") % 2 != 0:
-        return "attribute"
-    return "html_context"
+        return "not_found", False, ""
 
+    start = max(0, idx - 100)
+    end = min(len(response_body), idx + len(marker) + 100)
+    snippet = response_body[start:end]
 
-async def _scan_reflected(client: httpx.AsyncClient, url: str, findings: list, max_params: int):
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query, keep_blank_values=True)
+    # Check if inside an existing <script> tag
+    script_open = response_body.rfind("<script", 0, idx)
+    script_close = response_body.rfind("</script>", 0, idx)
+    if script_open > script_close:
+        return "javascript_context", True, snippet
 
-    if not params:
-        # Add a dummy param to probe for reflection
-        probe_url = url + ("&" if "?" in url else "?") + "q=XSS_PROBE"
-        injections = [("q", probe_url.replace("XSS_PROBE", p)) for p in PAYLOADS[:3]]
-    else:
-        injections = []
-        for key in list(params.keys())[:max_params]:
-            for payload in PAYLOADS[:6]:
-                modified = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-                modified[key] = payload
-                new_url = parsed._replace(query=urlencode(modified)).geturl()
-                injections.append((key, new_url))
+    # Check if inside a tag attribute (e.g. <input value="MARKER">)
+    tag_open = response_body.rfind("<", 0, idx)
+    tag_close = response_body.rfind(">", 0, idx)
+    if tag_open > tag_close:
+        # We are inside an HTML tag definition
+        return "attribute_context", True, snippet
 
-    vulnerable_params = set()
-    for param, test_url in injections:
-        if param in vulnerable_params:
-            continue
-        try:
-            r = await client.get(test_url, timeout=8, follow_redirects=True)
-            payload = test_url.split(f"{param}=", 1)[-1].split("&")[0]
-            if _check_reflection(r.text, payload):
-                context = _score_context(r.text, payload)
-                severity = "high" if context in ("script_context", "event_handler") else "medium"
-                vulnerable_params.add(param)
-                findings.append({
-                    "severity": severity,
-                    "title": f"Reflected XSS — Parameter `{param}`",
-                    "detail": (
-                        f"Payload `{payload[:80]}` was reflected unencoded in the response "
-                        f"(context: {context}). URL: {test_url[:120]}"
-                    ),
-                    "recommendation": (
-                        "Sanitize all user-supplied input server-side. Use contextual output encoding "
-                        "(HTML encode in HTML context, JS escape in script context). "
-                        "Implement a strict Content-Security-Policy (CSP) header."
-                    ),
-                })
-        except Exception:
-            pass
+    # Check if inside comment
+    if "<!--" in response_body[max(0, idx - 50):idx] and "-->" in response_body[idx:idx + 50]:
+        return "comment_context", False, snippet
 
-
-async def _scan_dom(client: httpx.AsyncClient, url: str, findings: list):
-    try:
-        r = await client.get(url, timeout=10, follow_redirects=True)
-        html = r.text
-        for sink_pattern in DOM_SINKS:
-            matches = re.findall(sink_pattern, html, re.I)
-            if matches:
-                findings.append({
-                    "severity": "medium",
-                    "title": f"Potential DOM XSS Sink — `{matches[0]}`",
-                    "detail": (
-                        f"Found {len(matches)} occurrence(s) of dangerous DOM sink `{matches[0]}` in "
-                        f"the page source. If user-controlled input reaches this sink, DOM-based XSS is possible."
-                    ),
-                    "recommendation": (
-                        "Audit JavaScript code that feeds user-controlled data (location.hash, "
-                        "URL params, postMessage) into these sinks. Use DOMPurify or textContent "
-                        "instead of innerHTML. Implement CSP with 'strict-dynamic'."
-                    ),
-                })
-    except Exception:
-        pass
-
-
-async def _scan_forms(client: httpx.AsyncClient, url: str, findings: list):
-    """Extract forms and probe inputs."""
-    try:
-        r = await client.get(url, timeout=10, follow_redirects=True)
-        # Find all form actions
-        form_actions = re.findall(r'<form[^>]*action=["\']([^"\']+)["\']', r.text, re.I)
-        input_names = re.findall(r'<input[^>]*name=["\']([^"\']+)["\']', r.text, re.I)
-
-        if not form_actions:
-            form_actions = [url]
-
-        for action in form_actions[:3]:
-            action_url = urljoin(url, action)
-            for name in input_names[:5]:
-                for payload in PAYLOADS[:4]:
-                    try:
-                        post_r = await client.post(
-                            action_url,
-                            data={name: payload},
-                            headers=HEADERS,
-                            timeout=8,
-                            follow_redirects=True,
-                        )
-                        if _check_reflection(post_r.text, payload):
-                            findings.append({
-                                "severity": "high",
-                                "title": f"Form XSS — Field `{name}` at `{action_url}`",
-                                "detail": (
-                                    f"XSS payload reflected in POST response for field `{name}`. "
-                                    f"Action: {action_url}. Payload: {payload[:60]}"
-                                ),
-                                "recommendation": (
-                                    "Validate and encode all form inputs server-side before rendering. "
-                                    "Use template engines with auto-escaping enabled."
-                                ),
-                            })
-                            break
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+    # In HTML body text context
+    return "html_body_context", True, snippet
 
 
 @router.post("/xss_scanner")
-async def xss_scan(req: XSSRequest):
-    t0 = time.time()
-    target = _normalize_url(req.target.strip())
-    findings = []
-    tested_urls = []
-    summary = {}
+async def xss_scanner(req: XSSRequest):
+    url = clean_url(req.target)
+    try:
+        validate_target_url(url)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
 
-    async with httpx.AsyncClient(headers=HEADERS, verify=False) as client:
-        tasks = []
-        mode = req.mode
+    parsed = urlparse(url)
+    existing_params = parse_qs(parsed.query, keep_blank_values=True)
 
-        if mode in ("reflected", "all"):
-            tasks.append(_scan_reflected(client, target, findings, req.max_params))
-        if mode in ("dom", "all"):
-            tasks.append(_scan_dom(client, target, findings))
-        if mode in ("forms", "all"):
-            tasks.append(_scan_forms(client, target, findings))
+    params_to_test = list(existing_params.keys())[:req.max_params]
+    if not params_to_test:
+        params_to_test = ["q", "search", "query", "id", "keyword"]
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+    findings: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
 
-    # Deduplicate
-    seen = set()
-    unique = []
-    for f in findings:
-        key = f["title"]
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
+    # Test baseline
+    try:
+        baseline_resp = await safe_request("GET", url, timeout=8.0)
+        baseline_body = baseline_resp.text
+    except Exception as e:
+        return err(f"Failed to reach target: {e}")
 
-    crits = sum(1 for f in unique if f["severity"] == "critical")
-    highs = sum(1 for f in unique if f["severity"] == "high")
-    meds  = sum(1 for f in unique if f["severity"] == "medium")
+    # Check DOM sinks in baseline HTML
+    if req.mode in ("dom", "all"):
+        for sink in DOM_SINKS:
+            match = re.search(sink, baseline_body, re.IGNORECASE)
+            if match:
+                findings.append(create_finding(
+                    title=f"Potential DOM XSS Sink Detected",
+                    severity="medium",
+                    confidence=Confidence.POSSIBLE.value,
+                    detail=f"Found dangerous DOM sink matching regex '{sink}' in client scripts.",
+                    recommendation="Avoid assigning untrusted data to dangerous DOM sinks (innerHTML, document.write). Use textContent or safe DOM APIs.",
+                    evidence=match.group(0),
+                ))
 
-    if not unique:
-        unique.append({
-            "severity": "pass",
-            "title": "No XSS Vulnerabilities Detected",
-            "detail": f"No reflected, DOM, or form-based XSS found at {target} with {len(PAYLOADS)} payloads.",
-            "recommendation": "Maintain current input sanitization practices. Run authenticated scans for deeper coverage.",
-        })
+    # Test reflected parameters
+    if req.mode in ("reflected", "all"):
+        for param in params_to_test:
+            # Step 1: Benign Canary Probe
+            canary_id = secrets.token_hex(4)
+            canary = f"bbcanary_{canary_id}"
+            probe_url = build_probe_url(url, param, canary)
 
-    summary = {
-        "Target": target,
-        "Mode": req.mode,
-        "Payloads Tested": str(len(PAYLOADS)),
-        "Findings": str(len(unique)),
-        "Critical/High": str(crits + highs),
-        "Duration": f"{time.time()-t0:.1f}s",
-    }
+            try:
+                canary_resp = await safe_request("GET", probe_url, timeout=7.0)
+                if canary not in canary_resp.text:
+                    records.append({
+                        "Parameter": param,
+                        "Status": "Not Reflected",
+                        "Confidence": "not_detected",
+                        "Context": "None",
+                        "Result": "Safe (No reflection)",
+                    })
+                    continue
 
-    return {
-        "success": True,
-        "data": {
-            "summary": summary,
-            "findings": unique,
+                # Step 2: Context Evaluation with HTML Breakout Probe
+                breakout_probe = f"bbxss{canary_id}<xss'\"test>"
+                breakout_url = build_probe_url(url, param, breakout_probe)
+                breakout_resp = await safe_request("GET", breakout_url, timeout=7.0)
+                breakout_body = breakout_resp.text
+
+                # Check if characters were entity encoded
+                encoded_lt = "&lt;" in breakout_body
+                unencoded_lt = f"<xss'\"test>" in breakout_body
+
+                if not unencoded_lt and encoded_lt:
+                    records.append({
+                        "Parameter": param,
+                        "Status": "Properly Encoded",
+                        "Confidence": "not_detected",
+                        "Context": "HTML Entity Encoded",
+                        "Result": "Safe (Input sanitized/encoded)",
+                    })
+                    continue
+
+                # Step 3: Executable Probe Test
+                tag_marker = f"bbsuite{canary_id}"
+                exec_payload = f"<{tag_marker} id=1>"
+                exec_url = build_probe_url(url, param, exec_payload)
+                exec_resp = await safe_request("GET", exec_url, timeout=7.0)
+
+                context_type, is_executable, snippet = analyze_reflection_context(exec_resp.text, tag_marker)
+
+                if exec_payload in exec_resp.text and is_executable:
+                    conf = Confidence.CONFIRMED
+                    sev = "critical" if context_type == "javascript_context" else "high"
+                    title = f"Reflected XSS ({conf.value.capitalize()}): param '{param}' in {context_type}"
+                    findings.append(create_finding(
+                        title=title,
+                        severity=sev,
+                        confidence=conf.value,
+                        detail=f"Injected unescaped HTML tag probe '{exec_payload}' into parameter '{param}'. The server reflected it unencoded in {context_type}.",
+                        recommendation="Encode all user-supplied output according to context (HTML entity encoding, JavaScript string escaping) and implement a restrictive Content-Security-Policy.",
+                        evidence=f"Reflected snippet: {snippet[:150]}",
+                    ))
+                    records.append({
+                        "Parameter": param,
+                        "Status": "Executable Reflection",
+                        "Confidence": conf.value,
+                        "Context": context_type,
+                        "Result": "💀 CONFIRMED VULNERABLE",
+                    })
+                elif unencoded_lt:
+                    conf = Confidence.LIKELY
+                    findings.append(create_finding(
+                        title=f"Potential Executable XSS (Likely): param '{param}'",
+                        severity="medium",
+                        confidence=conf.value,
+                        detail=f"Parameter '{param}' reflected special characters '<', '\"', ''' without HTML entity encoding, but custom tag execution was restricted.",
+                        recommendation="Enforce context-aware output encoding across all templates.",
+                        evidence=f"Unencoded reflection observed for parameter {param}",
+                    ))
+                    records.append({
+                        "Parameter": param,
+                        "Status": "Unencoded Reflection",
+                        "Confidence": conf.value,
+                        "Context": context_type,
+                        "Result": "🔥 LIKELY VULNERABLE",
+                    })
+                else:
+                    records.append({
+                        "Parameter": param,
+                        "Status": "Reflected Text Only",
+                        "Confidence": "possible",
+                        "Context": "Textual",
+                        "Result": "Reflected Text (Sanitized)",
+                    })
+
+            except Exception as e:
+                records.append({
+                    "Parameter": param,
+                    "Status": "Error",
+                    "Confidence": "not_detected",
+                    "Context": "None",
+                    "Result": f"Probe error: {str(e)[:30]}",
+                })
+
+    if not findings:
+        findings.append(create_finding(
+            title="No Executable XSS Detected",
+            severity="info",
+            confidence=Confidence.NOT_DETECTED.value,
+            detail="All tested parameters either did not reflect or properly encoded HTML special characters.",
+            recommendation="Maintain secure templating practices and CSP headers.",
+        ))
+
+    confirmed_count = sum(1 for f in findings if f.get("confidence") == "confirmed")
+    likely_count = sum(1 for f in findings if f.get("confidence") == "likely")
+
+    return ok({
+        "summary": {
+            "Target": url,
+            "Parameters Tested": len(params_to_test),
+            "Confirmed XSS": confirmed_count,
+            "Likely XSS": likely_count,
+            "Status": "Vulnerable" if (confirmed_count or likely_count) else "Secure",
         },
-    }
+        "findings": findings,
+        "records": records,
+        "record_columns": ["Parameter", "Status", "Confidence", "Context", "Result"],
+    })

@@ -1,8 +1,16 @@
 import sys
+import os
 import asyncio
 import hashlib
 import bcrypt
 sys.stdout.reconfigure(encoding='utf-8')
+
+_backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_root_dir = os.path.dirname(_backend_dir)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+if _root_dir not in sys.path:
+    sys.path.insert(0, _root_dir)
 
 from tools.password_cracker import password_cracker, calculate_entropy_metrics, generate_targeted_wordlist
 from tools.bruteforce import brute_force

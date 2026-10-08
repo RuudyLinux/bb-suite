@@ -6,6 +6,8 @@ dnspython==2.4.2
 pydantic==2.5.0
 python-multipart==0.0.6
 cryptography==41.0.7
+python-dotenv>=1.0.0
+bcrypt>=4.0.0
 
 # v3.0 — installed by install.bat
 playwright

@@ -402,8 +402,10 @@ Run `start.bat` from the root directory. The script executes the following autom
 Place external API keys in `key.env` at the project root:
 
 ```env
-ZAP API: fndorqfot05j2bg625a12uq0ag
-OpenRouter Key: sk-or-v1-your-openrouter-key-here
+ZAP_API_KEY=your-zap-api-key-here
+# Or standard KEY=value syntax:
+LOCAL_LLM_URL=http://localhost:11434
+LOCAL_LLM_MODEL=deepseek-r1
 ```
 
 ### 7.4 How to Add a New Security Tool

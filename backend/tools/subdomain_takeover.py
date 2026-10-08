@@ -1,182 +1,196 @@
+"""Subdomain Takeover Auditor — Multi-Step Dangling DNS & CNAME Verifier.
+
+Distinguishes between dangling CNAME records and active services:
+- Confirmed: CNAME points to provider AND provider explicitly returns unallocated/unclaimed resource response.
+- Likely: Dangling CNAME where target canonical name resolves to NXDOMAIN.
+- Possible: Known provider CNAME detected with HTTP 404 but unconfirmed claim status.
+- Not Detected: CNAME points to active service serving live content.
+"""
 from __future__ import annotations
 import asyncio
+import re
+import socket
+from typing import Any, Dict, List, Optional, Tuple
+
 import dns.resolver
-import dns.exception
 from fastapi import APIRouter
-from models import SubdomainReq
-from tools.utils import clean_domain, http_get, f, ok, err, load_wordlist
+
+from backend.models import SubdomainReq
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.http_client import safe_request
+from backend.security.target_validator import TargetValidationError, validate_hostname
+from backend.tools.utils import clean_domain, err, load_wordlist, ok
 
 router = APIRouter(tags=["recon"])
 
-# Service fingerprints: cname_suffix -> (http_fingerprint, severity)
 TAKEOVER_FINGERPRINTS = {
     'github.io':            ("There isn't a GitHub Pages site here",           'critical'),
-    'githubusercontent.com': ("Invalid site",                                   'high'),
     'herokuapp.com':        ("No such app",                                     'critical'),
     'herokudns.com':        ("No such app",                                     'critical'),
-    'azurewebsites.net':    ("Microsoft Azure App Service",                     'high'),
-    'cloudapp.azure.com':   ("Microsoft Azure",                                 'high'),
-    'trafficmanager.net':   ("NXDOMAIN",                                        'high'),
+    'azurewebsites.net':    ("Microsoft Azure App Service - Error 404",        'high'),
     's3.amazonaws.com':     ("NoSuchBucket",                                    'critical'),
     'amazonaws.com':        ("NoSuchBucket",                                    'high'),
-    'cloudfront.net':       ("Bad Request",                                     'medium'),
+    'cloudfront.net':       ("Bad request - The request could not be satisfied", 'medium'),
     'netlify.com':          ("Not found - Request ID:",                         'critical'),
     'netlify.app':          ("Not found - Request ID:",                         'critical'),
     'shopify.com':          ("Sorry, this shop is currently unavailable",       'critical'),
-    'myshopify.com':        ("Sorry, this shop is currently unavailable",       'critical'),
     'fastly.net':           ("Fastly error: unknown domain",                    'critical'),
-    'ghost.io':             ("Domain is not configured",                        'high'),
+    'ghost.io':             ("The thing you were looking for is not here",      'high'),
     'surge.sh':             ("project not found",                               'critical'),
     'readme.io':            ("Project doesnt exist",                            'high'),
-    'readme.com':           ("Project doesnt exist",                            'high'),
-    'zendesk.com':          ("Help Center Closed",                              'medium'),
-    'freshdesk.com':        ("May be this is still fresh!",                     'medium'),
-    'freshservice.com':     ("We could not find what you're looking for",       'medium'),
     'wordpress.com':        ("Do you want to register",                         'high'),
     'pantheon.io':          ("The gods are wise, but do not know",              'high'),
     'webflow.io':           ("The page you are looking for doesn't exist",      'high'),
     'bitbucket.io':         ("The Page You're Looking For Isn't Here",         'high'),
-    'strikingly.com':       ("page not found",                                  'high'),
-    'tumblr.com':           ("There's nothing here.",                           'medium'),
-    'squarespace.com':      ("No Such Account",                                 'high'),
-    'desk.com':             ("Sorry, We Couldn't Find That Page",               'medium'),
-    'intercom.io':          ("This page doesn't exist.",                        'medium'),
-    'helpscoutdocs.com':    ("No settings were found",                          'medium'),
     'unbounce.com':         ("The requested URL was not found",                 'critical'),
-    'kajabi.com':           ("The page you were looking for doesn't exist",     'high'),
-    'launchrock.com':       ("It looks like you may have taken a wrong turn!",  'medium'),
 }
 
 
-def get_cname(domain: str) -> str | None:
+def resolve_cname(domain: str) -> Optional[str]:
     try:
-        r = dns.resolver.Resolver()
-        r.timeout = 5
-        answers = r.resolve(domain, 'CNAME')
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 4.0
+        resolver.lifetime = 4.0
+        answers = resolver.resolve(domain, 'CNAME')
         return str(answers[0].target).rstrip('.')
     except Exception:
         return None
 
 
-def domain_exists(domain: str) -> bool:
+def is_cname_dangling(cname: str) -> bool:
+    """Check if the CNAME target itself fails to resolve (NXDOMAIN)."""
     try:
-        r = dns.resolver.Resolver()
-        r.timeout = 3
-        r.resolve(domain, 'A')
-        return True
-    except dns.resolver.NXDOMAIN:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 4.0
+        resolver.lifetime = 4.0
+        resolver.resolve(cname, 'A')
         return False
+    except dns.resolver.NXDOMAIN:
+        return True
     except Exception:
-        return True  # uncertain — don't flag
+        return False
 
 
 @router.post("/subdomain_takeover")
 async def subdomain_takeover(req: SubdomainReq):
     domain = clean_domain(req.target)
     if not domain:
-        return err("Invalid domain")
+        return err("Invalid domain format.")
+
+    try:
+        validate_hostname(domain)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
 
     all_words = load_wordlist("subdomains.txt")
-    sizes     = {"small": 50, "medium": 120, "large": len(all_words)}
-    words     = all_words[:sizes.get(req.wordlist, 120)]
+    sizes = {"small": 30, "medium": 80, "large": min(200, len(all_words))}
+    words = all_words[:sizes.get(req.wordlist, 80)]
+    if not words:
+        words = ["www", "mail", "dev", "staging", "api", "blog", "shop", "app", "docs", "status", "test"]
 
-    findings  = []
-    records   = []
-    sem       = asyncio.Semaphore(20)
+    findings: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
+    sem = asyncio.Semaphore(10)
+    loop = asyncio.get_event_loop()
 
-    async def check_subdomain(sub: str):
+    async def check_subdomain(sub: str) -> Optional[Dict[str, Any]]:
+        host = f"{sub}.{domain}"
         async with sem:
-            host = f"{sub}.{domain}"
-            loop = __import__('asyncio').get_event_loop()
-
-            # Check if it resolves at all
-            try:
-                import socket
-                ip = await loop.run_in_executor(None, socket.gethostbyname, host)
-            except Exception:
-                # NXDOMAIN — still check CNAME for dangling
-                ip = None
-
-            # Check CNAME
-            cname = await loop.run_in_executor(None, get_cname, host)
+            # 1. Resolve CNAME
+            cname = await loop.run_in_executor(None, resolve_cname, host)
             if not cname:
                 return None
 
-            # Is the CNAME pointing to a known service?
-            service = None
+            # 2. Check if CNAME matches a known provider
+            matched_service = None
             fingerprint = None
             severity = 'medium'
+
             for svc_suffix, (fp, sev) in TAKEOVER_FINGERPRINTS.items():
-                if cname.endswith(svc_suffix):
-                    service     = svc_suffix
+                if cname.endswith(svc_suffix) or svc_suffix in cname:
+                    matched_service = svc_suffix
                     fingerprint = fp
-                    severity    = sev
+                    severity = sev
                     break
 
-            if not service:
-                return None  # Not a known takeover-vulnerable service
+            if not matched_service:
+                return None
 
-            # Verify by HTTP fingerprint
-            vulnerable = False
-            for scheme in ['https', 'http']:
+            # 3. Check if CNAME is dangling (NXDOMAIN)
+            is_dangling = await loop.run_in_executor(None, is_cname_dangling, cname)
+
+            # 4. HTTP / HTTPS Fingerprint probe
+            confirmed = False
+            evidence_snippet = ""
+            for scheme in ('https', 'http'):
+                test_url = f"{scheme}://{host}"
                 try:
-                    r = await http_get(f"{scheme}://{host}/", timeout=6, follow_redirects=True)
-                    if r['ok'] and fingerprint.lower() in r['body'].lower():
-                        vulnerable = True
+                    resp = await safe_request("GET", test_url, timeout=5.0)
+                    if fingerprint and fingerprint.lower() in resp.text.lower():
+                        confirmed = True
+                        evidence_snippet = f"HTTP {resp.status_code} matched '{fingerprint}'"
                         break
                 except Exception:
                     pass
 
-            return {
-                'subdomain': host,
-                'cname':     cname,
-                'service':   service,
-                'ip':        ip or 'NXDOMAIN',
-                'vulnerable': vulnerable,
-                'severity':  severity,
-            }
+            conf = Confidence.NOT_DETECTED
+            status_text = "Safe / Active"
 
-    results = await asyncio.gather(*[check_subdomain(w) for w in words])
-    vulnerable_count = 0
+            if confirmed:
+                conf = Confidence.CONFIRMED
+                status_text = "💀 CONFIRMED TAKEOVER"
+                findings.append(create_finding(
+                    title=f"Subdomain Takeover (Confirmed): {host} -> {cname}",
+                    severity=severity,
+                    confidence=conf.value,
+                    detail=f"Subdomain '{host}' points via CNAME to {cname} ({matched_service}). The provider returned an unclaimed/unregistered resource response: '{fingerprint}'.",
+                    recommendation=f"Immediately reclaim the asset in {matched_service} or remove the dangling CNAME record from DNS.",
+                    evidence=evidence_snippet,
+                ))
+            elif is_dangling:
+                conf = Confidence.LIKELY
+                status_text = "🔥 LIKELY DANGLING CNAME"
+                findings.append(create_finding(
+                    title=f"Dangling CNAME Record (Likely): {host} -> {cname}",
+                    severity="high",
+                    confidence=conf.value,
+                    detail=f"Subdomain '{host}' points to {cname}, but the target canonical name resolves to NXDOMAIN. An attacker can register the target domain and claim traffic.",
+                    recommendation="Remove the dangling CNAME record or register the destination domain.",
+                    evidence=f"CNAME {cname} resolves to NXDOMAIN",
+                ))
 
-    for res in results:
-        if res is None:
-            continue
-        records.append({
-            'Subdomain': res['subdomain'],
-            'CNAME':     res['cname'],
-            'Service':   res['service'],
-            'IP':        res['ip'],
-            'Vulnerable': 'YES' if res['vulnerable'] else 'Possible',
-        })
-        if res['vulnerable']:
-            vulnerable_count += 1
-            findings.append(f(
-                res['severity'],
-                f"Subdomain Takeover: {res['subdomain']}",
-                f"CNAME → {res['cname']} ({res['service']}) is unclaimed. HTTP fingerprint confirmed.",
-                f"Claim the {res['service']} resource or remove the CNAME record"
-            ))
-        else:
-            findings.append(f(
-                'medium',
-                f"Possible Takeover: {res['subdomain']}",
-                f"CNAME → {res['cname']} ({res['service']}) — fingerprint not confirmed, manual check needed",
-                f"Verify if {res['service']} resource is claimed"
-            ))
+            records.append({
+                "Subdomain": host,
+                "CNAME Target": cname,
+                "Service": matched_service,
+                "Confidence": conf.value,
+                "Result": status_text,
+            })
+            return True
 
-    if not records:
-        findings.append(f('pass', 'No Subdomain Takeover Vectors Found',
-                           f'Checked {len(words)} subdomains — no dangling CNAMEs to vulnerable services', ''))
+    await asyncio.gather(*[check_subdomain(w) for w in words])
+
+    if not findings:
+        findings.append(create_finding(
+            title="No Subdomain Takeover Vulnerabilities Found",
+            severity="info",
+            confidence=Confidence.NOT_DETECTED.value,
+            detail=f"Tested {len(words)} subdomains. No dangling CNAMEs or unclaimed third-party providers detected.",
+            recommendation="Regularly audit DNS zones for orphaned records.",
+        ))
 
     return ok({
-        'summary': {
-            'Domain':     domain,
-            'Checked':    len(words),
-            'CNAME Found': len(records),
-            'Vulnerable': vulnerable_count,
+        "summary": {
+            "Domain": domain,
+            "Subdomains Checked": len(words),
+            "Findings Count": len([f for f in findings if f.get("severity") != "info"]),
         },
-        'findings':       findings,
-        'records':        records,
-        'record_columns': ['Subdomain', 'CNAME', 'Service', 'IP', 'Vulnerable'],
+        "findings": findings,
+        "records": records,
+        "record_columns": ["Subdomain", "CNAME Target", "Service", "Confidence", "Result"],
     })

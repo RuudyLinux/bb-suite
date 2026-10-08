@@ -1,18 +1,30 @@
-"""
-GraphQL Security Auditor — Deep GraphQL API reconnaissance & vulnerability auditor.
-Tests Introspection disclosure, schema extraction, field suggestion leaks, and batch query DoS amplification.
-Inspired by Strix protocols/graphql methodologies.
+"""GraphQL Security Auditor — Deep GraphQL API reconnaissance & vulnerability auditor.
+
+Performs controlled, rate-bounded assessments of GraphQL services:
+- Introspection disclosure and sensitive type classification
+- Field suggestion information leakage
+- Batch query amplification support
+- Controlled query depth handling
 """
 from __future__ import annotations
 import asyncio
 import json
 import re
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
-from typing import List, Dict, Any, Optional
-import httpx
+
 from fastapi import APIRouter
-from pydantic import BaseModel
-from tools.utils import clean_url, f, ok, err, HEADERS
+from pydantic import BaseModel, Field
+
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.http_client import safe_request
+from backend.security.target_validator import TargetValidationError, validate_target_url
+from backend.tools.utils import clean_url, err, ok
 
 router = APIRouter(tags=["scanning"])
 
@@ -23,22 +35,16 @@ GRAPHQL_ENDPOINTS = [
     "/v2/graphql",
     "/gql",
     "/query",
-    "/api/query",
-    "/api/v1/graphql",
-    "/graphql/console",
-    "/graphiql"
+    "/graphiql",
 ]
 
 INTROSPECTION_QUERY = """
 query IntrospectionQuery {
   __schema {
     queryType { name }
-    mutationType { name }
-    subscriptionType { name }
     types {
       name
       kind
-      description
       fields {
         name
       }
@@ -48,166 +54,157 @@ query IntrospectionQuery {
 """
 
 SENSITIVE_TYPE_PATTERNS = re.compile(
-    r'user|auth|account|admin|password|credit|card|payment|token|secret|billing|session|order',
-    re.I
+    r'user|auth|account|admin|password|credit|card|payment|token|secret|billing|session|private',
+    re.IGNORECASE,
 )
 
 
 class GraphqlRequest(BaseModel):
-    target: str
-    endpoint: str = ""  # If specified, tests directly; else probes common paths
+    target: str = Field(..., min_length=1, max_length=2048)
+    endpoint: str = Field("", max_length=512)
 
 
 @router.post("/graphql_scanner")
 async def graphql_scanner(req: GraphqlRequest):
     base_url = clean_url(req.target)
-    
-    endpoints_to_probe = []
+    try:
+        validate_target_url(base_url)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
+
+    endpoints_to_probe: List[str] = []
     if req.endpoint and req.endpoint.strip():
         endpoints_to_probe = [urljoin(base_url, req.endpoint.strip())]
     else:
         endpoints_to_probe = [urljoin(base_url, ep) for ep in GRAPHQL_ENDPOINTS]
 
-    findings = []
-    records = []
-    active_endpoints = []
-    discovered_schema = {}
-    introspection_enabled = False
-    field_suggestions_enabled = False
-    batching_enabled = False
+    findings: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
 
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=8) as client:
-        # Step 1: Discover valid GraphQL endpoints
-        async def probe_endpoint(ep_url: str):
-            try:
-                # Query simple __typename
-                payload = {"query": "{ __typename }"}
-                r = await client.post(ep_url, json=payload, headers={**HEADERS, "Content-Type": "application/json"})
-                if r.status_code in (200, 400):
-                    data = r.text
-                    if "data" in data or "errors" in data or "GraphQL" in data or "syntax" in data.lower():
-                        return ep_url, r.status_code
-            except Exception:
-                pass
-            return None, 0
+    active_endpoint: Optional[str] = None
 
-        probe_results = await asyncio.gather(*[probe_endpoint(ep) for ep in endpoints_to_probe])
-        for ep, status in probe_results:
-            if ep:
-                active_endpoints.append(ep)
+    # Step 1: Discover active GraphQL endpoint with bounded queries
+    for ep_url in endpoints_to_probe:
+        try:
+            r = await safe_request(
+                "POST",
+                ep_url,
+                json_data={"query": "{ __typename }"},
+                timeout=5.0,
+            )
+            if r.status_code in (200, 400) and ("data" in r.text or "errors" in r.text or "__typename" in r.text):
+                active_endpoint = ep_url
+                break
+        except Exception:
+            pass
 
-        if not active_endpoints:
-            # Also test GET on base_url for GraphiQL
-            try:
-                get_r = await client.get(urljoin(base_url, "/graphql"), headers=HEADERS)
-                if "GraphiQL" in get_r.text or "playground" in get_r.text.lower():
-                    active_endpoints.append(urljoin(base_url, "/graphql"))
-            except Exception:
-                pass
+    if not active_endpoint:
+        return ok({
+            "summary": {"Target": base_url, "GraphQL Detected": "No"},
+            "findings": [create_finding(
+                title="No GraphQL Service Discovered",
+                severity="info",
+                confidence=Confidence.NOT_DETECTED.value,
+                detail=f"Tested standard paths on {base_url}; no responsive GraphQL service was found.",
+            )],
+            "records": [],
+            "record_columns": ["Endpoint", "Introspection", "Batching", "Field Suggestions", "Sensitive Types"],
+        })
 
-        if not active_endpoints:
-            return ok({
-                "summary": {"Target URL": base_url, "Endpoints Tested": len(endpoints_to_probe), "GraphQL Detected": "No"},
-                "findings": [f("info", "No GraphQL Endpoints Found", f"Audited {len(endpoints_to_probe)} standard paths without GraphQL response.")],
-                "records": [],
-                "record_columns": ["Endpoint", "Status", "Introspection", "Batching", "Sensitive Types Found"]
-            })
-
-        # Step 2: Audit each discovered GraphQL endpoint
-        for ep_url in active_endpoints:
-            ep_records = {
-                "Endpoint": ep_url,
-                "Status": "Active (HTTP 200)",
-                "Introspection": "Disabled",
-                "Batching": "Disabled",
-                "Sensitive Types Found": "0"
-            }
-
-            # A. Introspection Test
-            try:
-                r_intro = await client.post(ep_url, json={"query": INTROSPECTION_QUERY}, headers={**HEADERS, "Content-Type": "application/json"})
-                if r_intro.status_code == 200:
-                    intro_json = r_intro.json()
-                    schema = intro_json.get("data", {}).get("__schema")
-                    if schema:
-                        introspection_enabled = True
-                        ep_records["Introspection"] = "✓ VULNERABLE (Enabled)"
-                        types = schema.get("types", [])
-                        custom_types = [t for t in types if not t.get("name", "").startswith("__")]
-
-                        sensitive_types = [
-                            t.get("name") for t in custom_types
-                            if SENSITIVE_TYPE_PATTERNS.search(t.get("name", ""))
-                        ]
-
-                        discovered_schema[ep_url] = {
-                            "queryType": schema.get("queryType", {}).get("name"),
-                            "mutationType": schema.get("mutationType", {}).get("name"),
-                            "total_types": len(custom_types),
-                            "sensitive_types": sensitive_types,
-                        }
-
-                        ep_records["Sensitive Types Found"] = f"{len(sensitive_types)} ({', '.join(sensitive_types[:3])})"
-
-                        findings.append(f(
-                            "critical",
-                            f"GraphQL Introspection Enabled ({ep_url})",
-                            f"Full API schema exposed via Introspection. Found {len(custom_types)} types and {len(sensitive_types)} sensitive models ({', '.join(sensitive_types[:5])}).",
-                            "Disable Introspection in production deployments (e.g., Apollo Server `introspection: false`)."
-                        ))
-            except Exception:
-                pass
-
-            # B. Field Suggestion Leakage Test (deliberate invalid field)
-            try:
-                typo_query = {"query": "{ testInvalidFieldXYZ99 }"}
-                r_typo = await client.post(ep_url, json=typo_query, headers={**HEADERS, "Content-Type": "application/json"})
-                resp_text = r_typo.text
-                if "Did you mean" in resp_text or "did you mean" in resp_text.lower():
-                    field_suggestions_enabled = True
-                    findings.append(f(
-                        "high",
-                        f"GraphQL Field Suggestions Leaked ({ep_url})",
-                        "Server suggests valid schema fields on invalid queries. Attackers can brute-force the entire schema even with introspection disabled.",
-                        "Disable field suggestions in GraphQL production configuration (e.g. `validationRules`)."
-                    ))
-            except Exception:
-                pass
-
-            # C. Batch Query / Query Amplification (DoS) Test
-            try:
-                batch_payload = [{"query": "{ __typename }"}] * 25
-                r_batch = await client.post(ep_url, json=batch_payload, headers={**HEADERS, "Content-Type": "application/json"})
-                if r_batch.status_code == 200 and isinstance(r_batch.json(), list) and len(r_batch.json()) == 25:
-                    batching_enabled = True
-                    ep_records["Batching"] = "✓ VULNERABLE (25x Batch Allowed)"
-                    findings.append(f(
-                        "high",
-                        f"GraphQL Batch Query Amplification Allowed ({ep_url})",
-                        "Server processes 25+ operations bundled in a single HTTP request without rate-limiting. Enables brute-force attacks and application DoS.",
-                        "Enforce query batch limits or disable batch queries entirely."
-                    ))
-            except Exception:
-                pass
-
-            records.append(ep_records)
-
-    summary = {
-        "Base URL": base_url,
-        "Active Endpoints": len(active_endpoints),
-        "Introspection Exposed": "CRITICAL YES" if introspection_enabled else "Disabled",
-        "Field Suggestions Leaked": "YES" if field_suggestions_enabled else "No",
-        "Batch Query DoS Risk": "YES" if batching_enabled else "No",
+    # Step 2: Audit Discovered Endpoint
+    ep_record = {
+        "Endpoint": active_endpoint,
+        "Introspection": "Disabled",
+        "Batching": "Disabled",
+        "Field Suggestions": "Disabled",
+        "Sensitive Types": "0",
     }
 
-    result = {
-        "summary": summary,
+    # A. Introspection Analysis
+    try:
+        r_intro = await safe_request(
+            "POST",
+            active_endpoint,
+            json_data={"query": INTROSPECTION_QUERY},
+            timeout=7.0,
+        )
+        if r_intro.status_code == 200:
+            intro_data = r_intro.json()
+            schema = intro_data.get("data", {}).get("__schema")
+            if schema:
+                ep_record["Introspection"] = "Enabled"
+                types = schema.get("types", [])
+                custom_types = [t for t in types if not t.get("name", "").startswith("__")]
+                sensitive_types = [
+                    t.get("name") for t in custom_types
+                    if SENSITIVE_TYPE_PATTERNS.search(t.get("name", ""))
+                ]
+                ep_record["Sensitive Types"] = str(len(sensitive_types))
+
+                sev = "medium" if sensitive_types else "low"
+                findings.append(create_finding(
+                    title=f"GraphQL Introspection Enabled ({'Sensitive Types Exposed' if sensitive_types else 'Schema Readable'})",
+                    severity=sev,
+                    confidence=Confidence.CONFIRMED.value,
+                    detail=f"GraphQL introspection is fully enabled at {active_endpoint}, revealing {len(custom_types)} types and {len(sensitive_types)} potentially sensitive schemas.",
+                    recommendation="Disable schema introspection in production deployments to prevent schema enumeration.",
+                    evidence=f"Sensitive schemas found: {', '.join(sensitive_types[:5])}" if sensitive_types else "Schema types exposed.",
+                ))
+    except Exception:
+        pass
+
+    # B. Field Suggestion Leakage Test
+    try:
+        r_suggest = await safe_request(
+            "POST",
+            active_endpoint,
+            json_data={"query": "{ __nonexistent_field_x123 }"},
+            timeout=5.0,
+        )
+        if "did you mean" in r_suggest.text.lower():
+            ep_record["Field Suggestions"] = "Enabled"
+            findings.append(create_finding(
+                title="GraphQL Field Suggestions Enabled",
+                severity="low",
+                confidence=Confidence.CONFIRMED.value,
+                detail="The GraphQL engine leaks field names in syntax error messages (e.g., 'Did you mean ...?'), assisting attackers in brute-forcing hidden schema fields.",
+                recommendation="Disable field suggestions in production (e.g., disable suggestions in Apollo Server or GraphQL Yoga).",
+                evidence="Server error message included 'Did you mean'",
+            ))
+    except Exception:
+        pass
+
+    # C. Batch Query Support Test (Small, safe array of 2 queries)
+    try:
+        r_batch = await safe_request(
+            "POST",
+            active_endpoint,
+            json_data=[{"query": "{ __typename }"}, {"query": "{ __typename }"}],
+            timeout=5.0,
+        )
+        if r_batch.status_code == 200 and r_batch.text.strip().startswith('['):
+            ep_record["Batching"] = "Enabled"
+            findings.append(create_finding(
+                title="GraphQL Batch Queries Supported",
+                severity="low",
+                confidence=Confidence.CONFIRMED.value,
+                detail="The GraphQL endpoint accepts arrays of batched operations. If rate-limiting is not applied per-operation, this can be used to bypass request limits or amplify queries.",
+                recommendation="Enforce query complexity analysis, depth limits, and individual operation rate-limiting.",
+                evidence="Endpoint processed array of queries.",
+            ))
+    except Exception:
+        pass
+
+    records.append(ep_record)
+
+    return ok({
+        "summary": {
+            "Endpoint": active_endpoint,
+            "Introspection": ep_record["Introspection"],
+            "Batching": ep_record["Batching"],
+            "Field Suggestions": ep_record["Field Suggestions"],
+        },
         "findings": findings,
         "records": records,
-        "record_columns": ["Endpoint", "Status", "Introspection", "Batching", "Sensitive Types Found"],
-    }
-
-    if discovered_schema:
-        result["raw"] = json.dumps(discovered_schema, indent=2)
-
-    return ok(result)
+        "record_columns": ["Endpoint", "Introspection", "Batching", "Field Suggestions", "Sensitive Types"],
+    })

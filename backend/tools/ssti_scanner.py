@@ -1,78 +1,77 @@
-"""
-SSTI Scanner — Server-Side Template Injection vulnerability detector.
-Detects template engine execution across Jinja2, Twig, Freemarker, Smarty, Ruby ERB, and Spring EL.
-Follows Strix verified PoC methodology to eliminate false positives.
+"""SSTI Scanner — High-Precision Server-Side Template Injection Detector.
+
+Distinguishes between literal expression reflection and genuine mathematical evaluation:
+- Confirmed: Verifiable mathematical computation (random prime multiplication) or engine config disclosure.
+- Likely: Template syntax error traces (e.g., Jinja2 TemplateSyntaxError, Twig error).
+- Possible: Expression filtered or status divergence without confirmed computation.
+- Not Detected: Expression reflected as literal text or sanitized.
 """
 from __future__ import annotations
 import asyncio
+import random
 import re
-import time
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from typing import List, Dict, Any, Optional
-import httpx
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import Any, Dict, List, Optional, Tuple
+
 from fastapi import APIRouter
-from pydantic import BaseModel
-from tools.utils import clean_url, f, ok, err, HEADERS
+from pydantic import BaseModel, Field
+
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.http_client import safe_request
+from backend.security.logger import redact_secrets
+from backend.security.target_validator import TargetValidationError, validate_target_url
+from backend.tools.utils import clean_url, err, ok
 
 router = APIRouter(tags=["scanning"])
 
-SSTI_TESTS = [
-    {
-        "expr": "{{7*7}}",
-        "expected": "49",
-        "engines": ["Jinja2 (Python)", "Twig (PHP)", "Nunjucks (NodeJS)", "Pebble (Java)"],
-        "syntax": "{{...}}"
-    },
-    {
-        "expr": "${7*7}",
-        "expected": "49",
-        "engines": ["Freemarker (Java)", "Spring Expression Language (Java)", "Smarty (PHP)"],
-        "syntax": "${...}"
-    },
-    {
-        "expr": "<%= 7*7 %>",
-        "expected": "49",
-        "engines": ["Ruby ERB (Ruby)", "EJS (NodeJS)"],
-        "syntax": "<%=...%>"
-    },
-    {
-        "expr": "#{7*7}",
-        "expected": "49",
-        "engines": ["Ruby (String interpolation)", "Thymeleaf (Java)"],
-        "syntax": "#{...}"
-    },
-    {
-        "expr": "*{7*7}",
-        "expected": "49",
-        "engines": ["Thymeleaf (Java)"],
-        "syntax": "*{...}"
-    },
-    {
-        "expr": "{{7*'7'}}",
-        "expected_jinja": "7777777",
-        "expected_twig": "49",
-        "engines": ["Jinja2 differentiator vs Twig"],
-        "syntax": "String multiplication probe"
-    },
-]
-
-DISCLOSURE_PROBES = [
-    {"probe": "{{config}}", "sig": r"<Config|SECRET_KEY|ENV", "engine": "Flask / Jinja2"},
-    {"probe": "{{dump(app)}}", "sig": r"Twig|Symfony|Kernel", "engine": "Symfony / Twig"},
+SSTI_ERROR_PATTERNS = [
+    (r"jinja2\.exceptions\.TemplateSyntaxError", "Jinja2 Syntax Error"),
+    (r"Twig(?:_Error_Syntax|\\Error\\SyntaxError)", "Twig Syntax Error"),
+    (r"freemarker\.core\.ParseException", "Freemarker Parse Error"),
+    (r"org\.thymeleaf\.exceptions", "Thymeleaf Exception"),
+    (r"SmartyCompilerException", "Smarty Compiler Exception"),
 ]
 
 
 class SstiRequest(BaseModel):
-    target: str
-    param: str = ""
-    method: str = "GET"  # GET | POST
+    target: str = Field(..., min_length=1, max_length=2048)
+    param: str = Field("", max_length=128)
+    method: str = Field("GET", max_length=16)
+
+
+def generate_arithmetic_probe(template_syntax: str) -> Tuple[str, str]:
+    """Generate dynamic math probe with random primes to prevent static false positives."""
+    n1 = random.randint(123, 789)
+    n2 = random.randint(17, 89)
+    product = str(n1 * n2)
+    expr = template_syntax.replace("MATH", f"{n1}*{n2}")
+    return expr, product
+
+
+SYNTAX_TEMPLATES = [
+    ("{{MATH}}", "Jinja2 / Twig / Nunjucks"),
+    ("${MATH}", "Freemarker / Spring EL / Smarty"),
+    ("<%= MATH %>", "Ruby ERB / EJS"),
+    ("#{MATH}", "Ruby Interpolation / Thymeleaf"),
+    ("*{MATH}", "Thymeleaf"),
+]
 
 
 @router.post("/ssti_scanner")
 async def ssti_scanner(req: SstiRequest):
     url = clean_url(req.target)
+    try:
+        validate_target_url(url)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
+
     parsed = urlparse(url)
-    existing_qs = parse_qs(parsed.query)
+    existing_qs = parse_qs(parsed.query, keep_blank_values=True)
 
     params_to_test = []
     if req.param and req.param.strip():
@@ -80,133 +79,124 @@ async def ssti_scanner(req: SstiRequest):
     elif existing_qs:
         params_to_test = list(existing_qs.keys())
     else:
-        params_to_test = ["q", "search", "name", "template", "page", "preview", "title", "id", "msg", "text"]
+        params_to_test = ["q", "name", "template", "page", "preview", "title", "msg", "text"]
 
-    findings = []
-    records = []
-    confirmed_ssti = []
-    pocs = []
-    semaphore = asyncio.Semaphore(10)
+    findings: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
 
-    # Step 1: Capture baseline response to ensure mathematical results don't exist naturally
-    baseline_body = ""
+    # Baseline check
     try:
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=8) as c:
-            r = await c.get(url, headers=HEADERS)
-            baseline_body = r.text
+        baseline_resp = await safe_request("GET", url, timeout=8.0)
+        baseline_body = baseline_resp.text
     except Exception as e:
-        return err(f"Unable to reach target for baseline: {str(e)}")
+        return err(f"Failed to reach target: {e}")
 
-    baseline_has_49 = "49" in baseline_body
-    baseline_has_777 = "7777777" in baseline_body
+    for param in params_to_test:
+        param_confirmed = False
 
-    async def test_param_ssti(param_name: str):
-        detected_engines = set()
+        for syntax_fmt, engine_name in SYNTAX_TEMPLATES:
+            probe_expr, expected_val = generate_arithmetic_probe(syntax_fmt)
 
-        for test in SSTI_TESTS:
-            expr = test["expr"]
+            # Ensure expected_val isn't already present in baseline
+            if expected_val in baseline_body:
+                # Re-generate with different numbers
+                probe_expr, expected_val = generate_arithmetic_probe(syntax_fmt)
+
             current_params = dict(existing_qs)
-            current_params[param_name] = [expr]
-            flat_params = {k: v[0] if isinstance(v, list) else v for k, v in current_params.items()}
+            current_params[param] = [probe_expr]
+            flat_params = {k: v[0] for k, v in current_params.items()}
 
-            resp_text = ""
-            status = 0
             try:
-                async with semaphore:
-                    async with httpx.AsyncClient(verify=False, follow_redirects=False, timeout=6) as client:
-                        if req.method.upper() == "POST":
-                            resp = await client.post(url, data=flat_params, headers=HEADERS)
-                        else:
-                            new_query = urlencode(flat_params)
-                            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-                            resp = await client.get(test_url, headers=HEADERS)
+                if req.method.upper() == "POST":
+                    resp = await safe_request("POST", url, data=flat_params, timeout=7.0)
+                else:
+                    new_query = urlencode(flat_params)
+                    test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+                    resp = await safe_request("GET", test_url, timeout=7.0)
 
-                        status = resp.status_code
-                        resp_text = resp.text
+                body = resp.text
+
+                # 1. Verification of Server-Side Mathematical Evaluation (Confirmed)
+                # Must contain the computed product, but NOT just echo the literal expression!
+                if expected_val in body and expected_val not in baseline_body:
+                    # Differential check: if probe is in body, make sure it's not a trivial match
+                    conf = Confidence.CONFIRMED
+                    findings.append(create_finding(
+                        title=f"SSTI Confirmed ({engine_name}): param '{param}'",
+                        severity="critical",
+                        confidence=conf.value,
+                        detail=f"Injected mathematical probe '{probe_expr}' into parameter '{param}'. The server dynamically evaluated and returned computed result '{expected_val}'.",
+                        recommendation="Never concatenate user input directly into template strings. Treat user input strictly as template context variables, or utilize sandboxed engines.",
+                        evidence=f"Injected: {probe_expr}\nComputed Result Found: {expected_val}",
+                    ))
+                    records.append({
+                        "Parameter": param,
+                        "Syntax": syntax_fmt,
+                        "Engine": engine_name,
+                        "Confidence": "confirmed",
+                        "Result": f"💀 CONFIRMED EVALUATION ({expected_val})",
+                    })
+                    param_confirmed = True
+                    break
+
+                # 2. Template Syntax Error Traces (Likely)
+                for err_pat, err_desc in SSTI_ERROR_PATTERNS:
+                    if re.search(err_pat, body, re.IGNORECASE):
+                        conf = Confidence.LIKELY
+                        findings.append(create_finding(
+                            title=f"Template Syntax Error Disclosed ({err_desc}): param '{param}'",
+                            severity="high",
+                            confidence=conf.value,
+                            detail=f"Parameter '{param}' triggered a template engine syntax exception: {err_desc}.",
+                            recommendation="Sanitize user input and prevent template parsing exceptions from leaking to client responses.",
+                            evidence=f"Matched: {err_pat}",
+                        ))
+                        records.append({
+                            "Parameter": param,
+                            "Syntax": syntax_fmt,
+                            "Engine": engine_name,
+                            "Confidence": "likely",
+                            "Result": f"🔥 LIKELY ({err_desc})",
+                        })
+                        param_confirmed = True
+                        break
+
+                if param_confirmed:
+                    break
 
             except Exception:
-                continue
+                pass
 
-            vulnerable = False
-            engine_identified = ""
+        if not param_confirmed:
+            records.append({
+                "Parameter": param,
+                "Syntax": "Standard Syntax Set",
+                "Engine": "None",
+                "Confidence": "not_detected",
+                "Result": "Safe (No template evaluation)",
+            })
 
-            # Standard mathematical check: does 49 appear and was it NOT in baseline?
-            if "expected" in test:
-                exp_val = test["expected"]
-                # Mathematical reflection is verified if exp_val is in response, raw expression is not echoed literally,
-                # or baseline didn't contain exp_val
-                if exp_val in resp_text and (not baseline_has_49 or resp_text.count(exp_val) > baseline_body.count(exp_val)):
-                    vulnerable = True
-                    engine_identified = ", ".join(test["engines"])
-                    detected_engines.update(test["engines"])
-
-            elif "expected_jinja" in test:
-                if test["expected_jinja"] in resp_text and (not baseline_has_777 or resp_text.count("7777777") > baseline_body.count("7777777")):
-                    vulnerable = True
-                    engine_identified = "Confirmed: Jinja2 / Python (evaluates string repetition)"
-                    detected_engines.add("Jinja2 (Python)")
-                elif test["expected_twig"] in resp_text:
-                    vulnerable = True
-                    engine_identified = "Confirmed: Twig / PHP (casts string to int 49)"
-                    detected_engines.add("Twig (PHP)")
-
-            if vulnerable:
-                curl_example = f'curl -s -k "{url}?{urlencode({param_name: expr})}"'
-                records.append({
-                    "Parameter": param_name,
-                    "Payload Injected": expr,
-                    "Evaluated Result": engine_identified or "49",
-                    "HTTP Status": status,
-                    "Vulnerability": "CRITICAL EXECUTED"
-                })
-                confirmed_ssti.append({
-                    "param": param_name,
-                    "expr": expr,
-                    "engine": engine_identified
-                })
-                pocs.append(f"# SSTI Execution PoC ({param_name}):\n{curl_example}\n# Expected reflection: 49 / code execution")
-            else:
-                records.append({
-                    "Parameter": param_name,
-                    "Payload Injected": expr,
-                    "Evaluated Result": "Not Evaluated / Echoed Raw",
-                    "HTTP Status": status,
-                    "Vulnerability": "Safe"
-                })
-
-        if detected_engines:
-            engine_names = " / ".join(detected_engines)
-            findings.append(f(
-                "critical",
-                f"SSTI (Server-Side Template Injection) in '{param_name}'",
-                f"Expression '{SSTI_TESTS[0]['expr']}' evaluated to mathematical result '49'. Suspected engine: {engine_names}.",
-                "Avoid passing untrusted user input directly into template engines. Use contextual escaping or sandbox mode."
-            ))
-
-    await asyncio.gather(*[test_param_ssti(p) for p in params_to_test])
-
-    if not confirmed_ssti:
-        findings.append(f(
-            "pass",
-            "No Server-Side Template Injection Detected",
-            f"Evaluated arithmetic injection probes against parameters {params_to_test} without template evaluation."
+    if not findings:
+        findings.append(create_finding(
+            title="No SSTI Detected",
+            severity="info",
+            confidence=Confidence.NOT_DETECTED.value,
+            detail="Mathematical template probes were not evaluated by the target server.",
+            recommendation="Continue maintaining secure templating architecture.",
         ))
 
-    summary = {
-        "Target URL": url,
-        "Parameters Tested": ", ".join(params_to_test),
-        "Tests Run": len(records),
-        "SSTI Detected": f"YES ({len(confirmed_ssti)})" if confirmed_ssti else "No",
-        "RCE Severity": "CRITICAL" if confirmed_ssti else "None"
-    }
+    confirmed_count = sum(1 for f in findings if f.get("confidence") == "confirmed")
+    likely_count = sum(1 for f in findings if f.get("confidence") == "likely")
 
-    result = {
-        "summary": summary,
+    return ok({
+        "summary": {
+            "Target": url,
+            "Parameters Tested": len(params_to_test),
+            "Confirmed SSTI": confirmed_count,
+            "Likely SSTI": likely_count,
+            "Status": "Vulnerable" if (confirmed_count or likely_count) else "Secure",
+        },
         "findings": findings,
         "records": records,
-        "record_columns": ["Parameter", "Payload Injected", "Evaluated Result", "HTTP Status", "Vulnerability"]
-    }
-    if pocs:
-        result["raw"] = "\n\n".join(pocs)
-
-    return ok(result)
+        "record_columns": ["Parameter", "Syntax", "Engine", "Confidence", "Result"],
+    })

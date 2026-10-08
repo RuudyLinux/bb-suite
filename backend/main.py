@@ -1,17 +1,116 @@
-import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+"""BB-SUITE — Advanced Bug Bounty & Penetration Testing Suite.
 
-app = FastAPI(title="BugBounty Suite", version="4.0.0")
+Main Application Server with production security boundaries, centralized error handling,
+security headers middleware, configurable CORS, and authentication.
+"""
+from __future__ import annotations
+import logging
+import os
+import sys
+
+# Ensure backend and root are on sys.path for both package and module execution
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.dirname(_backend_dir)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+if _root_dir not in sys.path:
+    sys.path.insert(0, _root_dir)
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from backend.security.auth_router import auth_router
+from backend.security.config import (
+    BB_CORS_ORIGINS,
+    BB_ENV,
+    BB_HOST,
+    BB_PORT,
+    IS_DEVELOPMENT,
+    is_private_allowed,
+)
+from backend.security.logger import audit_logger, setup_logger
+from backend.security.target_validator import TargetValidationError
+
+logger = setup_logger("bb_suite.server")
+
+app = FastAPI(
+    title="BugBounty Suite",
+    version="4.0.0",
+    description="Authorized Penetration Testing and Bug Bounty Assessment Framework",
+    docs_url="/docs" if IS_DEVELOPMENT else None,
+    redoc_url="/redoc" if IS_DEVELOPMENT else None,
+)
+
+# CORS Configuration with verified allowed origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173", "http://127.0.0.1:8000"],
+    allow_origins=BB_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# Security Headers Middleware
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+
+    # API routes: disable aggressive caching to prevent token or result leakage
+    if request.url.path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+
+    return response
+
+
+# Global Exception Handlers
+@app.exception_handler(TargetValidationError)
+async def target_validation_exception_handler(request: Request, exc: TargetValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "success": False,
+            "data": {"summary": {}, "findings": [], "records": [], "record_columns": [], "raw": ""},
+            "error": f"Security Boundary Error: {str(exc)}",
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def global_unhandled_exception_handler(request: Request, exc: Exception):
+    # Log exception traceback server-side only
+    logger.exception("Unhandled server exception on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "data": {"summary": {}, "findings": [], "records": [], "record_columns": [], "raw": ""},
+            "error": "An internal server error occurred. Check server logs for details.",
+        },
+    )
+
+
+# System Health Endpoint
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "version": "4.0.0",
+        "environment": BB_ENV,
+        "private_targets_allowed": is_private_allowed(),
+        "database": "sqlite_wal",
+    }
+
+
+# Include Authentication Router
+app.include_router(auth_router, prefix="/api")
 
 # Recon tools
 from tools.whois import router as whois_r
@@ -60,6 +159,7 @@ from tools.ai_analysis import router as ai_r
 from tools.screenshots import router as ss_r
 from tools.zap_integration import router as zap_r
 from tools.reports import router as report_r
+from tools.auto_login import router as autologin_r
 
 ALL_ROUTERS = [
     # Recon
@@ -72,11 +172,11 @@ ALL_ROUTERS = [
     # Exploitation & PoC
     pc_r, sqli_r, bf_r, auth_r, rl_r, poc_r, pe_r,
     # Vuln Map, Intelligence & Reporting
-    vm_r, ai_r, ss_r, zap_r, report_r,
+    vm_r, ai_r, ss_r, zap_r, report_r, autologin_r,
 ]
 
-for router in ALL_ROUTERS:
-    app.include_router(router, prefix="/api")
+for r in ALL_ROUTERS:
+    app.include_router(r, prefix="/api")
 
 
 # Backward-compatibility wrappers for consolidated tools
@@ -150,28 +250,23 @@ async def alias_poc(req: dict):
     from tools.poc_generator import poc_generator, PocRequest
     return await poc_generator(PocRequest(
         target=req.get("target", ""),
-        tool_name=req.get("tool_name", ""),
-        vuln_type=req.get("vuln_type", ""),
-        parameter=req.get("parameter", ""),
-        payload=req.get("payload", ""),
-        method=req.get("method", "GET"),
-        headers=req.get("headers", {}),
-        extra=req.get("extra", "")
+        vuln_type=req.get("vuln_type", "xss"),
+        parameter=req.get("parameter", "q"),
+        custom_payload=req.get("custom_payload", req.get("payload", "")),
+        http_method=req.get("http_method", req.get("method", "GET")),
     ))
 
 
 @app.post("/api/xss")
 async def alias_xss(req: dict):
-    from tools.xss_scanner import xss_scanner
-    from models import TargetReq
-    return await xss_scanner(TargetReq(target=req.get("target", "")))
+    from tools.xss_scanner import xss_scanner, XSSRequest
+    return await xss_scanner(XSSRequest(target=req.get("target", "")))
 
 
 @app.post("/api/lfi")
 async def alias_lfi(req: dict):
-    from tools.lfi_scanner import lfi_scanner
-    from models import TargetReq
-    return await lfi_scanner(TargetReq(target=req.get("target", "")))
+    from tools.lfi_scanner import lfi_scanner, LFIRequest
+    return await lfi_scanner(LFIRequest(target=req.get("target", "")))
 
 
 # Database history endpoint
@@ -180,7 +275,7 @@ async def scan_history():
     try:
         from database import get_scan_history, get_top_findings
         return {"success": True, "data": {
-            "scans":    get_scan_history(20),
+            "scans": get_scan_history(20),
             "findings": get_top_findings(50),
         }}
     except Exception as e:
@@ -194,4 +289,5 @@ if os.path.exists(_dist):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    logger.info("Starting BB-SUITE on %s:%s (env=%s, reload=%s)", BB_HOST, BB_PORT, BB_ENV, IS_DEVELOPMENT)
+    uvicorn.run("main:app", host=BB_HOST, port=BB_PORT, reload=IS_DEVELOPMENT)

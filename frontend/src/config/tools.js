@@ -449,7 +449,7 @@ export const TOOL_CONFIGS = {
       { name: 'scan_type', label: 'Scan Type', type: 'select',
         options: [{ v: 'spider', l: 'Spider Only' }, { v: 'active', l: 'Active Scan', default: true },
                   { v: 'passive', l: 'Passive Scan' }, { v: 'full', l: 'Full (Spider + Active)' }] },
-      { name: 'api_key', label: 'ZAP API Key', type: 'text', defaultValue: 'fndorqfot05j2bg625a12uq0ag' },
+      { name: 'api_key', label: 'ZAP API Key (Optional)', placeholder: 'Leave blank to use backend ZAP_API_KEY', type: 'password' },
       { name: 'zap_host', label: 'ZAP Host', placeholder: 'http://localhost:8080', type: 'text', defaultValue: 'http://localhost:8080' },
     ]
   ),

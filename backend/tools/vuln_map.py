@@ -1,48 +1,64 @@
+"""Vulnerability Map & Multi-Vector Surface Mapper for BB-SUITE.
+
+Integrates multi-vector discovery (SQL error fingerprints, context-checked XSS, open redirect,
+information disclosure) with target validation and confidence classification.
+"""
 from __future__ import annotations
 import asyncio
-import re
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode, urlunparse
 from html.parser import HTMLParser
+import re
+from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+
 from fastapi import APIRouter
-from models import VulnMapReq
-from tools.utils import clean_url, http_get, f, ok, err
+
+from backend.models import VulnMapReq
+from backend.security.confidence import (
+    Confidence,
+    Severity,
+    create_finding,
+    standard_response,
+)
+from backend.security.target_validator import TargetValidationError, validate_target_url
+from backend.tools.utils import clean_url, err, f, http_get, ok
 
 router = APIRouter(tags=["scanning"])
 
-# ── SQL error fingerprints ────────────────────────────────────────────────────
 SQL_ERRORS = [
-    "you have an error in your sql syntax", "warning: mysql",
-    "ora-\d{5}", "microsoft ole db", "postgresql.*error",
-    "pg_query", "sqlite3", "unclosed quotation", "odbc driver",
-    "native client", "invalid query", "sqlstate",
+    r"you have an error in your sql syntax",
+    r"warning:\s*mysql",
+    r"ora-\d{4,5}",
+    r"microsoft ole db",
+    r"postgresql.*error",
+    r"pg_query",
+    r"sqlite3::sqlexception",
+    r"unclosed quotation",
+    r"odbc.*driver",
 ]
-SQL_RE = re.compile("|".join(SQL_ERRORS), re.I)
+SQL_RE = re.compile("|".join(SQL_ERRORS), re.IGNORECASE)
 
-# ── XSS reflection marker ────────────────────────────────────────────────────
-XSS_PROBE = "<xss-probe-7x9>"
+XSS_CANARY = "bbprobe7x9<test\"tag>"
 
-# ── Sensitive path patterns ───────────────────────────────────────────────────
 SENSITIVE_PATHS = [
     ".env", ".git/HEAD", "config.php.bak", "wp-config.php.bak",
-    ".htpasswd", "backup.sql", "db.sql", "dump.sql",
-    "phpinfo.php", "test.php", "info.php",
+    "backup.sql", "db.sql", "phpinfo.php",
 ]
-SENSITIVE_RE = re.compile(r"\.(env|bak|sql|backup|old|orig|htpasswd)$", re.I)
 
-# ── Open redirect ────────────────────────────────────────────────────────────
-REDIRECT_PARAMS = {"url", "redirect", "return", "next", "goto", "location",
-                   "dest", "destination", "redir", "redirect_url", "return_url"}
+REDIRECT_PARAMS = {
+    "url", "redirect", "return", "next", "goto", "location",
+    "dest", "destination", "redir", "redirect_url", "return_url",
+}
 
 IGNORE_EXT = re.compile(
-    r"\.(png|jpg|jpeg|gif|svg|ico|css|woff|ttf|eot|mp4|mp3|zip|pdf)(\?.*)?$",
-    re.I,
+    r"\.(png|jpg|jpeg|gif|svg|ico|css|woff|woff2|ttf|eot|mp4|mp3|zip|pdf|exe)(\?.*)?$",
+    re.IGNORECASE,
 )
 
 
 class _LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.links: list[str] = []
+        self.links: List[str] = []
 
     def handle_starttag(self, tag, attrs):
         d = dict(attrs)
@@ -66,11 +82,10 @@ def _inject(url: str, param: str, value: str) -> str:
     return urlunparse(p._replace(query=urlencode(qs, doseq=True)))
 
 
-async def _spider(base_url: str, max_pages: int) -> dict[str, dict]:
+async def _spider(base_url: str, max_pages: int) -> Dict[str, Dict[str, Any]]:
     base_netloc = urlparse(base_url).netloc
-    visited: dict[str, dict] = {}
-    queue: list[tuple[str, int]] = [(base_url, 0)]
-
+    visited: Dict[str, Dict[str, Any]] = {}
+    queue: List[Tuple[str, int]] = [(base_url, 0)]
     sem = asyncio.Semaphore(10)
 
     while queue and len(visited) < max_pages:
@@ -80,24 +95,24 @@ async def _spider(base_url: str, max_pages: int) -> dict[str, dict]:
             continue
 
         async with sem:
-            r = await http_get(url, timeout=8, follow_redirects=True)
+            r = await http_get(url, timeout=7, follow_redirects=True)
 
         visited[norm] = {
-            "url":    norm,
+            "url": norm,
             "status": r["status"],
-            "body":   r["body"],
+            "body": r.get("body", ""),
             "params": list(parse_qs(urlparse(url).query).keys()),
         }
 
         if depth >= 2 or not r["ok"]:
             continue
-        ct = r["headers"].get("content-type", "")
+        ct = r.get("headers", {}).get("content-type", "")
         if "text/html" not in ct:
             continue
 
         parser = _LinkParser()
         try:
-            parser.feed(r["body"])
+            parser.feed(r.get("body", ""))
         except Exception:
             pass
         for href in parser.links:
@@ -105,7 +120,7 @@ async def _spider(base_url: str, max_pages: int) -> dict[str, dict]:
                 absolute = urljoin(url, href)
                 if urlparse(absolute).netloc == base_netloc:
                     n = _normalize(absolute)
-                    if n not in visited:
+                    if n not in visited and len(visited) < max_pages:
                         queue.append((absolute, depth + 1))
             except Exception:
                 pass
@@ -116,46 +131,47 @@ async def _spider(base_url: str, max_pages: int) -> dict[str, dict]:
 async def _test_sqli(url: str, param: str) -> bool:
     for payload in ("'", "''", "' OR '1'='1"):
         injected = _inject(url, param, payload)
-        r = await http_get(injected, timeout=8)
-        if SQL_RE.search(r["body"]):
+        r = await http_get(injected, timeout=6)
+        if SQL_RE.search(r.get("body", "")):
             return True
     return False
 
 
 async def _test_xss(url: str, param: str) -> bool:
-    injected = _inject(url, param, XSS_PROBE)
-    r = await http_get(injected, timeout=8)
-    return XSS_PROBE.lower() in r["body"].lower()
+    injected = _inject(url, param, XSS_CANARY)
+    r = await http_get(injected, timeout=6)
+    body = r.get("body", "")
+    # Must reflect unescaped tag without entity encoding
+    return "<test\"tag>" in body and "&lt;test" not in body
 
 
 async def _test_open_redirect(url: str, param: str) -> bool:
-    injected = _inject(url, param, "https://evil.example.com")
-    r = await http_get(injected, timeout=8, follow_redirects=False)
-    loc = r["headers"].get("location", "")
-    return "evil.example.com" in loc
+    injected = _inject(url, param, "https://example-security-test.com")
+    r = await http_get(injected, timeout=6, follow_redirects=False)
+    loc = r.get("headers", {}).get("location", "")
+    return "example-security-test.com" in loc
 
 
-async def _probe_page(page: dict) -> dict:
-    url    = page["url"]
+async def _probe_page(page: Dict[str, Any]) -> Dict[str, Any]:
+    url = page["url"]
     params = page["params"]
-    vulns: list[str] = []
+    vulns: List[str] = []
 
-    # Check for error/info disclosure in base response
     body = page["body"]
     if SQL_RE.search(body):
         vulns.append("sql_error_disclosure")
 
-    if re.search(r"Parse error:|Fatal error:|Warning: .*\(\)", body, re.I):
+    if re.search(r"Parse error:|Fatal error:|Warning: .*\(\)", body, re.IGNORECASE):
         vulns.append("php_error_disclosure")
 
-    if re.search(r"Traceback \(most recent|django\.debug|djdt", body, re.I):
+    if re.search(r"Traceback \(most recent|django\.debug", body, re.IGNORECASE):
         vulns.append("debug_mode")
 
-    if re.search(r"Index of /", body):
+    if "Index of /" in body and page["status"] == 200:
         vulns.append("directory_listing")
 
-    # Param-based tests
-    for param in params[:5]:  # limit to first 5 params
+    # Limit param testing to first 3 to prevent excessive requests
+    for param in params[:3]:
         sqli = await _test_sqli(url, param)
         if sqli:
             vulns.append(f"sqli:{param}")
@@ -167,10 +183,9 @@ async def _probe_page(page: dict) -> dict:
             if redir:
                 vulns.append(f"open_redirect:{param}")
 
-    # Check if sensitive path
     path = urlparse(url).path
-    if SENSITIVE_RE.search(path):
-        if page["status"] == 200 and len(body) > 50:
+    if any(path.endswith(ext) for ext in (".env", ".bak", ".sql", ".backup")):
+        if page["status"] == 200 and len(body) > 30:
             vulns.append("sensitive_file_exposed")
 
     return {"url": url, "status": page["status"], "vulns": vulns}
@@ -179,32 +194,38 @@ async def _probe_page(page: dict) -> dict:
 @router.post("/vuln_map")
 async def vuln_map(req: VulnMapReq):
     base_url = clean_url(req.target)
-    max_pages = min(req.max_pages, 80)
+    try:
+        validate_target_url(base_url)
+    except TargetValidationError as tve:
+        return err(f"Target validation failed: {tve}")
+
+    max_pages = min(req.max_pages, 50)
 
     # 1. Spider
     pages = await _spider(base_url, max_pages)
-
     if not pages:
-        return err("Could not reach target — check URL")
+        return err("Could not reach target or target is empty.")
 
-    # 2. Also probe sensitive paths directly
-    sem = asyncio.Semaphore(10)
+    # 2. Probe sensitive paths
+    sem = asyncio.Semaphore(5)
 
     async def check_sensitive(path: str):
         async with sem:
             url = base_url.rstrip("/") + "/" + path.lstrip("/")
             r = await http_get(url, timeout=5, follow_redirects=False)
-            if r["status"] == 200 and len(r["body"]) > 50:
+            if r["status"] == 200 and len(r.get("body", "")) > 30:
                 norm = _normalize(url)
                 if norm not in pages:
                     pages[norm] = {
-                        "url": norm, "status": 200,
-                        "body": r["body"], "params": [],
+                        "url": norm,
+                        "status": 200,
+                        "body": r["body"],
+                        "params": [],
                     }
 
     await asyncio.gather(*[check_sensitive(p) for p in SENSITIVE_PATHS])
 
-    # 3. Probe each page for vulns (concurrency-limited)
+    # 3. Probe pages
     probe_sem = asyncio.Semaphore(5)
 
     async def safe_probe(p):
@@ -214,20 +235,20 @@ async def vuln_map(req: VulnMapReq):
     probed = list(await asyncio.gather(*[safe_probe(p) for p in pages.values()]))
 
     # 4. Build results
-    cracked: list[dict] = []
-    clean:   list[dict] = []
-    records: list[dict] = []
-    findings = []
+    cracked: List[Dict[str, Any]] = []
+    clean: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
 
     SEV_MAP = {
-        "sqli":                   ("critical", "SQL Injection"),
-        "xss":                    ("high",     "Reflected XSS"),
-        "open_redirect":          ("high",     "Open Redirect"),
-        "sql_error_disclosure":   ("high",     "SQL Error Disclosure"),
-        "sensitive_file_exposed": ("high",     "Sensitive File Exposed"),
-        "php_error_disclosure":   ("medium",   "PHP Error Disclosure"),
-        "debug_mode":             ("high",     "Debug Mode Active"),
-        "directory_listing":      ("medium",   "Directory Listing"),
+        "sqli": ("critical", "SQL Injection", "confirmed"),
+        "xss": ("high", "Reflected XSS", "confirmed"),
+        "open_redirect": ("high", "Open Redirect", "confirmed"),
+        "sql_error_disclosure": ("high", "SQL Error Disclosure", "confirmed"),
+        "sensitive_file_exposed": ("high", "Sensitive File Exposed", "confirmed"),
+        "php_error_disclosure": ("medium", "PHP Error Disclosure", "likely"),
+        "debug_mode": ("high", "Debug Mode Active", "confirmed"),
+        "directory_listing": ("medium", "Directory Listing", "confirmed"),
     }
 
     for p in probed:
@@ -236,67 +257,64 @@ async def vuln_map(req: VulnMapReq):
         if not vulns:
             clean.append(p)
             records.append({
-                "URL":    url,
+                "URL": url,
                 "Status": p["status"],
-                "Vulns":  "—",
+                "Vulns": "—",
                 "Cracked": "—",
             })
             continue
 
-        # Determine highest severity
         max_sev = "info"
         sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
         labels = []
         for v in vulns:
             key = v.split(":")[0]
-            sev, label = SEV_MAP.get(key, ("info", v))
+            sev, label, conf = SEV_MAP.get(key, ("info", v, "possible"))
             param = v.split(":", 1)[1] if ":" in v else ""
             display = f"{label} ({param})" if param else label
             labels.append(display)
             if sev_order.get(sev, 0) > sev_order.get(max_sev, 0):
                 max_sev = sev
             findings.append(f(
-                sev, f"{label}: {urlparse(url).path or '/'}",
+                sev,
+                f"{label}: {urlparse(url).path or '/'}",
                 f"URL: {url}" + (f" | param: {param}" if param else ""),
-                "Immediately patch this vulnerability",
+                "Remediate input validation and output encoding on this endpoint.",
+                confidence=conf,
             ))
 
         cracked.append({
-            "url":    url,
+            "url": url,
             "status": p["status"],
-            "vulns":  vulns,
+            "vulns": vulns,
             "labels": labels,
-            "sev":    max_sev,
+            "sev": max_sev,
         })
         records.append({
-            "URL":     url,
-            "Status":  p["status"],
-            "Vulns":   ", ".join(labels),
+            "URL": url,
+            "Status": p["status"],
+            "Vulns": ", ".join(labels),
             "Cracked": "⚡ YES",
         })
 
     if not cracked:
-        findings.append(f("pass", "No Vulnerabilities Detected",
-                           f"Scanned {len(probed)} pages — all clean",
-                           "Continue manual testing; automated scans miss logic flaws"))
-    else:
-        findings.insert(0, f(
-            "critical",
-            f"⚡ {len(cracked)} VULNERABLE PAGES FOUND",
-            f"{len(cracked)} pages cracked out of {len(probed)} scanned",
-            "Fix all critical issues before deploying",
+        findings.append(f(
+            "pass",
+            "No Vulnerabilities Detected on Crawled Endpoints",
+            f"Crawled and analyzed {len(probed)} pages; no high-severity vulnerabilities observed.",
+            confidence="not_detected",
         ))
 
     return ok({
         "summary": {
-            "Target":           base_url,
-            "Pages Scanned":    len(probed),
-            "Cracked Pages":    len(cracked),
-            "Clean Pages":      len(clean),
+            "Target": base_url,
+            "Pages Scanned": len(probed),
+            "Vulnerable Pages": len(cracked),
+            "Clean Pages": len(clean),
         },
-        "findings":       findings,
-        "records":        records,
+        "findings": findings,
+        "records": records,
         "record_columns": ["URL", "Status", "Vulns", "Cracked"],
-        "cracked_pages":  cracked,
-        "clean_pages":    [p["url"] for p in clean],
+        "cracked_pages": cracked,
+        "clean_pages": [p["url"] for p in clean],
     })
